@@ -7,7 +7,7 @@
   - Postgres … 部屋・メンバー・カフェ情報
   - Storage … 収集した写真・アップロードした写真
   - Edge Function `process-cafe` … リンク先の情報収集
-- **AI補完（任意）**: Anthropic API キーを設定すると、Claude が Web 検索で公式HP・食べログ・Instagram・営業時間などを探して補完します
+- **AI補完（任意）**: Gemini API キーを設定すると、Gemini が Google 検索で公式HP・食べログ・Instagram・営業時間などを探して補完します
 
 ## 使い方
 
@@ -21,11 +21,11 @@
 ## 情報収集のしくみ
 
 1. 貼られたページを取得し、JSON-LD（構造化データ）・OGP・店舗情報の表（住所/営業時間/定休日…）・SNSリンクを抽出
-2. `ANTHROPIC_API_KEY` があれば、Claude が Web 検索で店舗を特定し関連リンクと基本情報を補完
+2. `GEMINI_API_KEY` があれば、Gemini が Google 検索（グラウンディング）とURL読み込みで店舗を特定し、関連リンクと基本情報を補完（AIが挙げたURLは実在チェックしてから採用）
 3. 見つかった食べログ・公式HPも取得して、写真と情報を追加
 4. 写真は Supabase Storage にコピーして保存（リンク切れ防止）
 
-> 食べログや公式HPのリンクは API キーなしでもかなりの情報が取れます。Instagram のリンクだけだと店名程度しか取れないため、AI補完の設定をおすすめします（1件あたり数十円程度）。
+> 食べログや公式HPのリンクは API キーなしでもかなりの情報が取れます。Instagram のリンクだけだと店名程度しか取れないため、AI補完の設定をおすすめします。Gemini API には無料枠があり、2人で使う程度なら無料枠の範囲に収まる見込みです（Google検索グラウンディングは検索回数に応じた課金対象なので、最新の料金は https://ai.google.dev/gemini-api/docs/pricing を確認してください）。
 
 ---
 
@@ -50,12 +50,12 @@
    | `SUPABASE_ACCESS_TOKEN` | 1 で発行したトークン |
    | `SUPABASE_PROJECT_REF` | Project ref |
    | `SUPABASE_DB_PASSWORD` | DB パスワード |
-   | `ANTHROPIC_API_KEY` | （任意）https://console.anthropic.com で発行した API キー |
+   | `GEMINI_API_KEY` | （任意）https://aistudio.google.com/apikey で発行した API キー |
 
 3. **Actions → Deploy Supabase → Run workflow** を実行
 
 > ローカルに Supabase CLI がある場合は `supabase link` → `supabase functions deploy process-cafe --no-verify-jwt` でも可。
-> 使用モデルは既定で `claude-opus-5`。費用を抑えたい場合は関数のシークレットに `CLAUDE_MODEL=claude-sonnet-5` などを設定してください。
+> 使用モデルは既定で `gemini-3.8-flash`。変更したい場合は **Settings → Secrets and variables → Actions → Variables** に `GEMINI_MODEL`（例: `gemini-3.5-flash-lite`）を登録してワークフローを再実行してください。
 
 ### 3. フロントの設定
 
@@ -87,6 +87,6 @@
 ```
 index.html / css/ / js/          フロントエンド（GitHub Pages で配信）
 supabase/migrations/             DB スキーマと RPC 関数
-supabase/functions/process-cafe/ 情報収集の Edge Function（index.ts: 全体処理と Claude 連携, scrape.ts: ページ解析）
+supabase/functions/process-cafe/ 情報収集の Edge Function（index.ts: 全体処理と Gemini 連携, scrape.ts: ページ解析）
 .github/workflows/               Supabase への自動デプロイ
 ```

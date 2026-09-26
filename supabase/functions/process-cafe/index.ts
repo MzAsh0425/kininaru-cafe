@@ -1,13 +1,12 @@
 // カフェ情報の収集処理
 // POST { key, id } を受け取ったら即 202 を返し、バックグラウンドで
 //   1. 貼られたURLを取得して JSON-LD / OGP / 店舗情報表 / SNSリンクを抽出
-//   2. ANTHROPIC_API_KEY があれば Claude の Web検索で公式HP・食べログ・SNS・基本情報を補完
+//   2. GEMINI_API_KEY があれば Gemini の Google検索で公式HP・食べログ・SNS・基本情報を補完
 //   3. 見つかった関連ページ（食べログ・HP）も取得して写真と情報を追加
 //   4. 写真を Storage に保存し、cafes テーブルを更新
 // を行う。
 
 import { createClient } from "npm:@supabase/supabase-js@2";
-import Anthropic from "npm:@anthropic-ai/sdk@0.128";
 import {
   classifyLink, dedupe, dedupeLinks, guessArea, normalizeUrl, scrapePage, UA,
   type Info, type Link, type PageData,
@@ -15,8 +14,8 @@ import {
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
-const ANTHROPIC_API_KEY = Deno.env.get("ANTHROPIC_API_KEY");
-const CLAUDE_MODEL = Deno.env.get("CLAUDE_MODEL") ?? "claude-opus-5";
+const GEMINI_API_KEY = Deno.env.get("GEMINI_API_KEY");
+const GEMINI_MODEL = Deno.env.get("GEMINI_MODEL") ?? "gemini-3.8-flash";
 
 const db = createClient(SUPABASE_URL, SERVICE_KEY, { auth: { persistSession: false } });
 
@@ -86,13 +85,13 @@ async function processCafe(cafe: Record<string, any>) {
     const source = await scrapePage(sourceUrl);
     const pages: PageData[] = source ? [source] : [];
 
-    // Claude による補完（キーがあるときのみ）
+    // Gemini による補完（キーがあるときのみ）
     let ai: AiResult | null = null;
-    if (ANTHROPIC_API_KEY) {
+    if (GEMINI_API_KEY) {
       try {
-        ai = await researchWithClaude(sourceUrl, source);
+        ai = await researchWithGemini(sourceUrl, source);
       } catch (e) {
-        console.error("claude failed", e);
+        console.error("gemini failed", e);
       }
     }
     // AIが見つけた公式アカウント等を優先（共有元URL自体は source_url として別途表示する）
@@ -112,7 +111,7 @@ async function processCafe(cafe: Record<string, any>) {
     }
     links = dedupeLinks(links);
 
-    // 情報のマージ: Claude > 食べログ > その他ページ の順に優先
+    // 情報のマージ: Gemini > 食べログ > その他ページ の順に優先
     const ordered = [...pages].sort((a, b) => pageRank(a.url) - pageRank(b.url));
     const info: Info = {};
     for (const src of [ai?.info ?? {}, ...ordered.map((p) => p.info)]) {
@@ -145,7 +144,7 @@ async function processCafe(cafe: Record<string, any>) {
     const existingPhotos: string[] = Array.isArray(current.photos) ? current.photos : [];
     patch.photos = dedupe([...existingPhotos, ...photos]).slice(0, 12);
     patch.status = "done";
-    patch.error = ai || !ANTHROPIC_API_KEY ? null : "AIによる補完に失敗したため、ページ解析結果のみです";
+    patch.error = ai || !GEMINI_API_KEY ? null : "AIによる補完に失敗したため、ページ解析結果のみです";
     patch.processed_at = new Date().toISOString();
     patch.updated_at = new Date().toISOString();
 
@@ -169,113 +168,119 @@ function pageRank(url: string) {
 }
 
 // ---------------------------------------------------------------------------
-// Claude による調査
+// Gemini による調査（Google検索グラウンディング + URL読み込み + JSON構造化出力）
 // ---------------------------------------------------------------------------
 type AiResult = { info: Info; links: Link[]; imageUrls: string[] };
 
-const SAVE_TOOL = {
-  name: "save_cafe_info",
-  description: "調査したカフェの情報を保存する。調査が終わったら必ず1回だけ呼び出す。",
-  strict: true,
-  input_schema: {
-    type: "object",
-    additionalProperties: false,
-    required: [
-      "name", "summary", "genre", "area", "address", "hours", "holidays", "price", "phone", "access",
-      "official_url", "tabelog_url", "instagram_url", "x_url", "google_maps_url", "other_urls", "image_urls",
-    ],
-    properties: {
-      name: { type: "string", description: "店名。不明なら空文字" },
-      summary: { type: "string", description: "どんな店かを伝える日本語の紹介文（60〜120字）。雰囲気・名物メニューなど" },
-      genre: { type: "string", description: "例: カフェ、喫茶店、ベーカリー、スイーツ" },
-      area: { type: "string", description: "エリア名。例: 渋谷、代官山、京都・祇園" },
-      address: { type: "string", description: "住所（郵便番号付きが望ましい）" },
-      hours: { type: "string", description: "営業時間。曜日別に改行で区切る" },
-      holidays: { type: "string", description: "定休日" },
-      price: { type: "string", description: "予算の目安。例: ¥1,000〜¥1,999" },
-      phone: { type: "string" },
-      access: { type: "string", description: "最寄り駅からのアクセス" },
-      official_url: { type: "string", description: "公式サイトのURL（なければ空文字）" },
-      tabelog_url: { type: "string", description: "食べログの店舗ページURL（なければ空文字）" },
-      instagram_url: { type: "string", description: "店舗公式InstagramアカウントのURL（なければ空文字）" },
-      x_url: { type: "string", description: "店舗公式X(Twitter)アカウントのURL（なければ空文字）" },
-      google_maps_url: { type: "string", description: "GoogleマップのURL（なければ空文字）" },
-      other_urls: {
-        type: "array",
-        description: "その他の関連リンク（Retty、ホットペッパー、Facebook、TikTok、オンラインショップなど）",
-        items: {
-          type: "object",
-          additionalProperties: false,
-          required: ["label", "url"],
-          properties: { label: { type: "string" }, url: { type: "string" } },
-        },
-      },
-      image_urls: {
-        type: "array",
-        description: "取得したページ内で見つけた、店内・外観・料理の写真の直接URL（jpg/png/webp）。確実なものだけ。なければ空配列",
-        items: { type: "string" },
+const CAFE_SCHEMA = {
+  type: "object",
+  properties: {
+    name: { type: "string", description: "店名。不明なら空文字" },
+    summary: { type: "string", description: "どんな店かを伝える日本語の紹介文（60〜120字）。雰囲気・名物メニューなど" },
+    genre: { type: "string", description: "例: カフェ、喫茶店、ベーカリー、スイーツ" },
+    area: { type: "string", description: "エリア名。例: 渋谷、代官山、京都・祇園" },
+    address: { type: "string", description: "住所（郵便番号付きが望ましい）" },
+    hours: { type: "string", description: "営業時間。曜日別に改行で区切る" },
+    holidays: { type: "string", description: "定休日" },
+    price: { type: "string", description: "予算の目安。例: ¥1,000〜¥1,999" },
+    phone: { type: "string" },
+    access: { type: "string", description: "最寄り駅からのアクセス" },
+    official_url: { type: "string", description: "公式サイトのURL（なければ空文字）" },
+    tabelog_url: { type: "string", description: "食べログの店舗ページURL（なければ空文字）" },
+    instagram_url: { type: "string", description: "店舗公式InstagramアカウントのURL（なければ空文字）" },
+    x_url: { type: "string", description: "店舗公式X(Twitter)アカウントのURL（なければ空文字）" },
+    google_maps_url: { type: "string", description: "GoogleマップのURL（なければ空文字）" },
+    other_urls: {
+      type: "array",
+      description: "その他の関連リンク（Retty、ホットペッパー、Facebook、TikTok、オンラインショップなど）",
+      items: {
+        type: "object",
+        properties: { label: { type: "string" }, url: { type: "string" } },
+        required: ["label", "url"],
       },
     },
+    image_urls: {
+      type: "array",
+      description: "読み込んだページ内にあった、店内・外観・料理の写真の直接URL（jpg/png/webp）。確実なものだけ。なければ空配列",
+      items: { type: "string" },
+    },
   },
-} as const;
+  required: [
+    "name", "summary", "genre", "area", "address", "hours", "holidays", "price", "phone", "access",
+    "official_url", "tabelog_url", "instagram_url", "x_url", "google_maps_url", "other_urls", "image_urls",
+  ],
+};
 
-async function researchWithClaude(sourceUrl: string, source: PageData | null): Promise<AiResult | null> {
-  // Edge Function の実行時間上限（無料枠 150 秒）に収まるよう、調査全体の締め切りを設ける
-  const deadline = Date.now() + 95_000;
-  const client = new Anthropic({ apiKey: ANTHROPIC_API_KEY, maxRetries: 0 });
-
+async function researchWithGemini(sourceUrl: string, source: PageData | null): Promise<AiResult | null> {
   const hints = source
     ? `\n\n参考: 共有URLを事前に解析した結果（不正確な場合あり）\n${JSON.stringify({ info: source.info, links: source.links }, null, 1).slice(0, 3000)}`
     : "\n\n（共有URLは直接取得できませんでした。SNSなどの可能性があります）";
+  const prompt =
+    `次のURLは友人が「気になるカフェ」として共有したものです。\n${sourceUrl}\n\n` +
+    `このURLが指す店舗を特定し、Google検索とURLの読み込みで、公式サイト・食べログ・Instagram・X・Googleマップなどの関連リンクと、` +
+    `住所・営業時間・定休日・予算・アクセスなどの基本情報を調べてください。` +
+    `情報は日本語でまとめ、確認できなかった項目は空文字にしてください（推測で埋めないこと）。` +
+    `URLは検索結果や読み込んだページで実在を確認できたものだけを、正規のURL（リダイレクト用URLではなく）で入れてください。` +
+    `結果は指定のJSON形式で返してください。${hints}`;
 
-  const messages: any[] = [{
-    role: "user",
-    content:
-      `次のURLは友人が「気になるカフェ」として共有したものです。\n${sourceUrl}\n\n` +
-      `このURLが指す店舗を特定し、Web検索とページ取得で、公式サイト・食べログ・Instagram・X・Googleマップなどの関連リンクと、` +
-      `住所・営業時間・定休日・予算・アクセスなどの基本情報を調べてください。` +
-      `情報は日本語でまとめ、確認できなかった項目は空文字にしてください（推測で埋めないこと）。` +
-      `URLは実在を確認できたものだけを入れてください。` +
-      `調べ終わったら save_cafe_info ツールを1回呼び出して結果を保存してください。${hints}`,
-  }];
+  // Edge Function の実行時間上限（無料枠 150 秒）に収まるよう締め切りを設ける
+  const deadline = Date.now() + 80_000;
+  const body = (structured: boolean) => ({
+    contents: [{ role: "user", parts: [{ text: structured ? prompt : `${prompt}\n\nJSONのキー: ${CAFE_SCHEMA.required.join(", ")}。JSON以外は出力しないこと。` }] }],
+    tools: [{ google_search: {} }, { url_context: {} }],
+    generationConfig: structured
+      ? { responseMimeType: "application/json", responseJsonSchema: CAFE_SCHEMA }
+      : {},
+  });
 
-  const tools: any[] = [
-    { type: "web_search_20260209", name: "web_search", max_uses: 5, user_location: { type: "approximate", country: "JP", timezone: "Asia/Tokyo" } },
-    { type: "web_fetch_20260209", name: "web_fetch", max_uses: 4 },
-    SAVE_TOOL,
-  ];
-
-  for (let i = 0; i < 4; i++) {
-    const remaining = deadline - Date.now();
-    if (remaining < 10_000) break;
-    const res: any = await client.beta.messages.create({
-      model: CLAUDE_MODEL,
-      max_tokens: 16000,
-      thinking: { type: "adaptive" },
-      output_config: { effort: "low" },
-      tools,
-      messages,
-      // ポリシー判定で断られた場合はサーバー側で別モデルに切り替えて継続する
-      betas: ["server-side-fallback-2026-07-01"],
-      fallbacks: "default",
-    } as any, { timeout: remaining });
-
-    const toolUse = res.content.find((b: any) => b.type === "tool_use" && b.name === SAVE_TOOL.name);
-    if (toolUse) return toAiResult(toolUse.input);
-
-    if (res.stop_reason === "pause_turn") {
-      messages.push({ role: "assistant", content: res.content });
-      continue;
-    }
-    if (res.stop_reason === "refusal") return null;
-    // ツールを呼ばずに終わった場合は保存を促す
-    messages.push({ role: "assistant", content: res.content });
-    messages.push({ role: "user", content: "調査結果を save_cafe_info ツールで保存してください。" });
+  let res = await callGemini(body(true), deadline);
+  // 構造化出力とツールの併用に対応していないモデルの場合は、テキストのJSONで受け取る
+  if (res.status === 400) {
+    console.warn("gemini structured output rejected, retrying without schema", await res.text());
+    res = await callGemini(body(false), deadline);
   }
-  return null;
+  if (!res.ok) throw new Error(`gemini ${res.status}: ${(await res.text()).slice(0, 300)}`);
+
+  const data = await res.json();
+  const text: string = (data.candidates?.[0]?.content?.parts ?? [])
+    .filter((p: any) => typeof p.text === "string" && !p.thought)
+    .map((p: any) => p.text)
+    .join("");
+  const parsed = parseJsonLoose(text);
+  if (!parsed) {
+    console.warn("gemini returned no json", data.candidates?.[0]?.finishReason, text.slice(0, 300));
+    return null;
+  }
+  return await toAiResult(parsed);
 }
 
-function toAiResult(input: any): AiResult {
+function callGemini(body: unknown, deadline: number) {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
+  return fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY! },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(Math.max(5_000, deadline - Date.now())),
+  });
+}
+
+function parseJsonLoose(text: string): any | null {
+  const cleaned = text.replace(/```(?:json)?/g, "").trim();
+  try {
+    return JSON.parse(cleaned);
+  } catch {
+    const start = cleaned.indexOf("{");
+    const end = cleaned.lastIndexOf("}");
+    if (start < 0 || end <= start) return null;
+    try {
+      return JSON.parse(cleaned.slice(start, end + 1));
+    } catch {
+      return null;
+    }
+  }
+}
+
+async function toAiResult(input: any): Promise<AiResult> {
   const s = (v: unknown) => (typeof v === "string" ? v.trim() : "");
   const info: Info = {
     name: s(input.name), summary: s(input.summary), genre: s(input.genre), area: s(input.area),
@@ -284,23 +289,47 @@ function toAiResult(input: any): AiResult {
   };
   for (const k of Object.keys(info) as (keyof Info)[]) if (!info[k]) delete info[k];
 
-  const links: Link[] = [];
+  const candidates: Link[] = [];
   const push = (url: string) => {
-    if (/^https?:\/\//.test(url)) links.push(classifyLink(url));
+    if (/^https?:\/\//.test(url)) candidates.push(classifyLink(url));
   };
   push(s(input.official_url));
   push(s(input.tabelog_url));
   push(s(input.instagram_url));
   push(s(input.x_url));
   push(s(input.google_maps_url));
-  for (const o of input.other_urls ?? []) {
+  for (const o of Array.isArray(input.other_urls) ? input.other_urls : []) {
     const url = s(o?.url);
     if (!/^https?:\/\//.test(url)) continue;
     const l = classifyLink(url);
-    links.push(l.type === "hp" || l.type === "other" ? { type: "other", label: s(o.label) || l.label, url } : l);
+    candidates.push(l.type === "hp" || l.type === "other" ? { type: "other", label: s(o.label) || l.label, url } : l);
   }
-  const imageUrls = (input.image_urls ?? []).map(s).filter((u: string) => /^https?:\/\//.test(u));
+  // AIが挙げたURLは実在確認してから採用する（存在しないURLを作ってしまうことがあるため）
+  const checked = await Promise.all(
+    candidates
+      .filter((l) => !/grounding-api-redirect|vertexaisearch/.test(l.url))
+      .map(async (l) => ((await urlExists(l.url)) ? l : null)),
+  );
+  const links = checked.filter((l): l is Link => !!l);
+  const imageUrls = (Array.isArray(input.image_urls) ? input.image_urls : [])
+    .map(s)
+    .filter((u: string) => /^https?:\/\//.test(u));
   return { info, links, imageUrls };
+}
+
+async function urlExists(url: string): Promise<boolean> {
+  try {
+    const res = await fetch(url, {
+      headers: { "User-Agent": UA },
+      redirect: "follow",
+      signal: AbortSignal.timeout(6000),
+    });
+    await res.body?.cancel();
+    // SNS はボット対策で 403 などを返すことがあるので、明確に存在しない場合だけ除外する
+    return res.status !== 404 && res.status !== 410;
+  } catch {
+    return false;
+  }
 }
 
 // ---------------------------------------------------------------------------
