@@ -1,14 +1,12 @@
-import { createClient } from "https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/+esm";
-import { SUPABASE_URL, SUPABASE_ANON_KEY } from "./config.js";
+import { API_URL } from "./config.js";
 
-const configured = !SUPABASE_URL.includes("YOUR-") && !SUPABASE_ANON_KEY.includes("YOUR-");
-const sb = configured ? createClient(SUPABASE_URL, SUPABASE_ANON_KEY, { auth: { persistSession: false } }) : null;
+const configured = /^https?:\/\//.test(API_URL) && !API_URL.includes("/XXXX/");
 
 const SESSION_KEY = "cafe-share-session";
 const FILTER_KEY = "cafe-share-filter";
 const PALETTE = ["#E0694F", "#2F8F8B", "#7A5AC8", "#D39B1F", "#3F7FD1", "#C2527F"];
 const STALE_PENDING_MS = 60 * 1000;
-const STALE_PROCESSING_MS = 4 * 60 * 1000;
+const STALE_PROCESSING_MS = 7 * 60 * 1000;
 
 const LINK_STYLE = {
   hp: { abbr: "HP", color: "#5B6770", label: "公式サイト" },
@@ -83,10 +81,7 @@ async function start() {
 
 async function refresh({ silent = false } = {}) {
   if (!state.session) return;
-  const [members, cafes] = await Promise.all([
-    rpc("list_members", { p_key: state.session.key }),
-    rpc("list_cafes", { p_key: state.session.key }),
-  ]);
+  const { members, cafes } = await rpc("load", { p_key: state.session.key });
   state.members = members ?? [];
   state.cafes = cafes ?? [];
   schedulePoll();
@@ -116,20 +111,25 @@ function handleSharedUrlParam() {
 // ---------------------------------------------------------------------------
 // API
 // ---------------------------------------------------------------------------
-async function rpc(fn, args) {
-  const { data, error } = await sb.rpc(fn, args);
-  if (error) throw new Error(error.message);
-  return data;
+// GAS はプリフライト(CORS)に対応しないため text/plain で送る
+async function rpc(action, args = {}) {
+  const res = await fetch(API_URL, {
+    method: "POST",
+    headers: { "Content-Type": "text/plain;charset=utf-8" },
+    body: JSON.stringify({ action, ...args }),
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const json = await res.json();
+  if (!json.ok) throw new Error(json.error);
+  return json.data;
 }
 
-async function triggerProcess(id) {
-  try {
-    const { error } = await sb.functions.invoke("process-cafe", { body: { key: state.session.key, id } });
-    if (error) throw error;
-  } catch (e) {
-    console.error(e);
-    toast("情報収集の開始に失敗しました");
-  }
+// 情報収集は完了まで数十秒かかるので待たずに進める。
+// 通信が途切れてもサーバー側の定期処理（5分おき）が拾い直す。
+function triggerProcess(id) {
+  rpc("process", { p_key: state.session.key, p_id: id })
+    .then(() => refresh())
+    .catch((e) => console.warn("process request ended", e));
 }
 
 async function hashPassphrase(pass) {
@@ -187,7 +187,7 @@ function renderLogin() {
       <div class="logo">${logoSvg()}</div>
       <h1>きになるカフェ</h1>
       <p class="lead">気になったカフェを、リンクを貼るだけで共有</p>
-      ${configured ? "" : `<div class="config-warning">js/config.js に Supabase の URL とキーが設定されていません。README の手順に沿って設定してください。</div>`}
+      ${configured ? "" : `<div class="config-warning">js/config.js に Apps Script の URL が設定されていません。README の手順に沿って設定してください。</div>`}
       <label class="field"><span>合言葉</span>
         <input type="password" name="pass" required minlength="4" placeholder="ふたりで決めた合言葉" autocomplete="current-password">
       </label>
@@ -431,7 +431,7 @@ function openAddSheet(prefill = "") {
       else renderList();
       window.scrollTo({ top: 0, behavior: "smooth" });
       toast("追加しました。情報を収集中です");
-      await triggerProcess(cafe.id);
+      triggerProcess(cafe.id);
       schedulePoll();
     } catch (err) {
       console.error(err);
@@ -452,7 +452,7 @@ async function retry(id) {
     replaceCafe(c);
     render(false);
     toast("情報を再取得しています");
-    await triggerProcess(id);
+    triggerProcess(id);
     schedulePoll();
   } catch (e) {
     console.error(e);
@@ -804,13 +804,11 @@ function renderEdit(id) {
 }
 
 async function uploadPhoto(c, file) {
-  const blob = await resizeImage(file, 1600, 0.85);
-  const path = `${c.room_id}/${c.id}/u-${Date.now()}-${Math.random().toString(36).slice(2, 7)}.jpg`;
-  const { error } = await sb.storage.from("photos").upload(path, blob, { contentType: "image/jpeg" });
-  if (error) throw error;
-  return sb.storage.from("photos").getPublicUrl(path).data.publicUrl;
+  const dataUrl = await resizeImage(file, 1600, 0.85);
+  return rpc("upload_photo", { p_key: state.session.key, p_id: c.id, p_data: dataUrl });
 }
 
+// 端末で縮小して JPEG の data URL にする（iPhone の HEIC もここで JPEG になる）
 async function resizeImage(file, maxSize, quality) {
   const bitmap = await createImageBitmap(file);
   const scale = Math.min(1, maxSize / Math.max(bitmap.width, bitmap.height));
@@ -818,9 +816,7 @@ async function resizeImage(file, maxSize, quality) {
   canvas.width = Math.round(bitmap.width * scale);
   canvas.height = Math.round(bitmap.height * scale);
   canvas.getContext("2d").drawImage(bitmap, 0, 0, canvas.width, canvas.height);
-  return new Promise((resolve, reject) =>
-    canvas.toBlob((b) => (b ? resolve(b) : reject(new Error("toBlob failed"))), "image/jpeg", quality)
-  );
+  return canvas.toDataURL("image/jpeg", quality);
 }
 
 function classifyLink(url) {
