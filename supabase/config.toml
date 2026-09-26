@@ -1,0 +1,6 @@
+# Supabase CLI 設定（`supabase link` 後に project_id は上書きされても問題ありません）
+project_id = "cafe-share"
+
+[functions.process-cafe]
+# 新しい publishable key は JWT ではないため、関数側で合言葉ハッシュを検証する
+verify_jwt = false
