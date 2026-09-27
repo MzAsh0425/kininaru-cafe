@@ -326,6 +326,7 @@ function cardHtml(c) {
             ${who}
             <div class="state">${isError ? "情報を取得できませんでした" : stale ? "処理が止まっているようです" : "情報を収集中…"}</div>
             <div class="url">${h(c.source_url)}</div>
+            ${memoHtml(c)}
             ${isError || stale ? `<div class="actions">
               <button class="btn small ghost" data-action="retry" data-id="${h(c.id)}">再試行</button>
               <button class="btn small ghost" data-action="edit" data-id="${h(c.id)}">手動で入力</button>
@@ -355,12 +356,17 @@ function cardHtml(c) {
         <h2>${h(c.name || "名称未設定")}</h2>
         ${meta ? `<div class="meta">${h(meta)}</div>` : ""}
         ${c.summary ? `<p class="summary">${h(c.summary)}</p>` : ""}
+        ${memoHtml(c)}
         <div class="foot">
           <div class="hours-line">${firstHours ? `${ICONS.clock}<span>${h(firstHours)}${c.holidays ? `／休 ${h(c.holidays.split("\n")[0])}` : ""}</span>` : ""}</div>
           <div class="link-dots">${links.map((l) => linkDot(l.type)).join("")}</div>
         </div>
       </div>
     </article>`;
+}
+
+function memoHtml(c) {
+  return c.memo ? `<p class="card-memo">${h(c.memo)}</p>` : "";
 }
 
 function isStale(c) {
@@ -380,10 +386,10 @@ function openAddSheet(prefill = "") {
   const { close, el } = openSheet(`
     <h2>カフェを追加</h2>
     <p class="sub">HP・食べログ・Instagram・Googleマップなど、お店のリンクを貼ってください。関連情報は自動で集めます。</p>
-    <form id="add-form">
+    <form id="add-form" novalidate>
       <label class="field"><span>リンク</span>
         <div class="row">
-          <input type="url" name="url" required placeholder="https://..." inputmode="url" autocapitalize="off" autocorrect="off" value="${h(extractUrl(prefill) ?? "")}">
+          <textarea name="url" rows="2" class="url-field" required placeholder="リンクや共有テキストを貼り付け" inputmode="url" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false">${h(extractUrl(prefill) ?? "")}</textarea>
           <button type="button" class="btn ghost" id="paste-btn">ペースト</button>
         </div>
       </label>
@@ -394,24 +400,23 @@ function openAddSheet(prefill = "") {
     </form>`);
 
   const form = el.querySelector("#add-form");
-  const input = form.querySelector("input[name=url]");
+  // 1行の input だと貼り付け時に改行が消えて URL と後続の文字がつながるため textarea を使う
+  const input = form.querySelector("textarea[name=url]");
   if (!prefill) setTimeout(() => input.focus(), 300);
 
-  // 「店名 https://...」のような共有テキストを貼った場合も URL だけ取り出す
-  input.addEventListener("paste", (e) => {
-    const text = e.clipboardData?.getData("text") ?? "";
-    const url = extractUrl(text);
-    if (url) {
-      e.preventDefault();
-      input.value = url;
-    }
+  // 食べログアプリ等の「店名・電話番号・URL」が混ざった共有テキストを貼っても URL だけにする
+  // （長押しペースト・キーボードの候補・音声入力など、どの方法で入っても input イベントで拾う）
+  input.addEventListener("input", () => {
+    if (keepOnlyUrl(input)) toast("URLだけを取り出しました");
   });
   el.querySelector("#paste-btn").addEventListener("click", async () => {
     try {
       const text = await navigator.clipboard.readText();
       const url = extractUrl(text);
-      if (url) input.value = url;
-      else toast("クリップボードにURLがありません");
+      if (url) {
+        input.value = url;
+        if (url !== text.trim()) toast("URLだけを取り出しました");
+      } else toast("クリップボードにURLがありません");
     } catch {
       toast("入力欄を長押ししてペーストしてください");
     }
@@ -441,9 +446,32 @@ function openAddSheet(prefill = "") {
   });
 }
 
+// テキスト中の最初の URL を取り出す。日本語や全角記号は URL に含めない
 function extractUrl(text) {
-  const m = String(text ?? "").match(/https?:\/\/[^\s<>"'「」）)]+/);
-  return m ? m[0] : null;
+  const m = String(text ?? "").match(/https?:\/\/[A-Za-z0-9\-._~:/?#[\]@!$&'()*+,;=%]+/);
+  if (!m) return null;
+  let url = m[0];
+  // 文末の句読点や、対応する開き括弧のない閉じ括弧を取り除く
+  for (;;) {
+    if (/[.,;:!?'"#]$/.test(url)) url = url.slice(0, -1);
+    else if (url.endsWith(")") && count(url, "(") < count(url, ")")) url = url.slice(0, -1);
+    else if (url.endsWith("]") && count(url, "[") < count(url, "]")) url = url.slice(0, -1);
+    else break;
+  }
+  return /^https?:\/\/[^/?#]+\.[^/?#]+/.test(url) ? url : null;
+}
+
+function count(s, ch) {
+  return s.split(ch).length - 1;
+}
+
+// 入力欄に URL 以外の文字が混ざっていたら URL だけにする。書き換えたら true
+function keepOnlyUrl(input) {
+  const value = input.value;
+  const url = extractUrl(value);
+  if (!url || url === value.trim()) return false;
+  input.value = url;
+  return true;
 }
 
 async function retry(id) {
@@ -722,10 +750,11 @@ function renderEdit(id) {
     linksEl.innerHTML = draft.links.map((l, i) => `
       <div class="link-edit">
         <input class="label-input" data-i="${i}" data-k="label" value="${h(l.label ?? "")}" placeholder="表示名（例: Instagram）">
-        <input class="url-input" data-i="${i}" data-k="url" type="url" value="${h(l.url ?? "")}" placeholder="https://..." autocapitalize="off">
+        <input class="url-input" data-i="${i}" data-k="url" type="text" inputmode="url" value="${h(l.url ?? "")}" placeholder="https://..." autocapitalize="off" autocorrect="off" spellcheck="false">
         <button type="button" class="icon-btn remove" data-remove-link="${i}" aria-label="削除">${ICONS.close}</button>
       </div>`).join("");
     linksEl.querySelectorAll("input").forEach((inp) => inp.addEventListener("input", () => {
+      if (inp.dataset.k === "url") keepOnlyUrl(inp);
       const l = draft.links[Number(inp.dataset.i)];
       l[inp.dataset.k] = inp.value;
       if (inp.dataset.k === "url") {
