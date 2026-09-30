@@ -465,6 +465,11 @@ function decodeResponse_(res, contentType) {
 }
 
 function scrapePage_(url) {
+  // TikTok は通常のページ解析では情報が取れないので専用処理
+  if (/(^|\.)tiktok\.com$/.test((parseUrl_(url) || {}).host || '')) {
+    const tiktok = scrapeTikTok_(url);
+    if (tiktok) return tiktok;
+  }
   const res = fetchHtml_(url);
   if (!res) return null;
   const html = res.html;
@@ -609,6 +614,131 @@ function scrapePage_(url) {
   };
 }
 
+// ===========================================================================
+// TikTok（投稿の説明文・写真・位置情報タグを取得）
+// ===========================================================================
+function scrapeTikTok_(url) {
+  // vt.tiktok.com などの短縮リンクを展開して @ユーザー/video|photo/ID を得る
+  const resolved = resolveUrl_(url);
+  const m = /tiktok\.com\/@([^/?#]+)\/(?:video|photo)\/(\d+)/.exec(resolved);
+  if (!m) return null;
+  const postUrl = `https://www.tiktok.com/@${m[1]}/video/${m[2]}`; // 写真投稿も video 形式の URL で情報が取れる
+
+  let caption = '';
+  const images = [];
+  const info = {};
+
+  // 公式の oEmbed API（説明文・サムネイル）
+  try {
+    const res = UrlFetchApp.fetch('https://www.tiktok.com/oembed?url=' + encodeURIComponent(postUrl), {
+      muteHttpExceptions: true,
+      headers: { 'User-Agent': UA },
+    });
+    if (res.getResponseCode() === 200) {
+      const o = JSON.parse(res.getContentText());
+      caption = o.title || '';
+      if (o.thumbnail_url) images.push(o.thumbnail_url);
+    }
+  } catch (err) {
+    console.warn('tiktok oembed failed', err);
+  }
+
+  // 投稿ページに埋め込まれたデータ（写真投稿の全画像・位置情報タグ）
+  const page = fetchHtml_(postUrl);
+  if (page) {
+    const d = /<script[^>]+id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>([\s\S]*?)<\/script>/.exec(page.html);
+    try {
+      const scope = d ? JSON.parse(d[1]).__DEFAULT_SCOPE__ || {} : {};
+      const item = ((scope['webapp.video-detail'] || {}).itemInfo || {}).itemStruct || {};
+      if (!caption && item.desc) caption = item.desc;
+      ((item.imagePost || {}).images || []).forEach((img) => {
+        const u = ((img.imageURL || {}).urlList || [])[0];
+        if (u) images.push(u);
+      });
+      const video = item.video || {};
+      if (video.originCover || video.cover) images.push(video.originCover || video.cover);
+      const poi = item.poi || {};
+      if (poi.name) info.name = String(poi.name);
+      const poiAddress = poi.address || [poi.province, poi.city, poi.district].filter(Boolean).join(' ');
+      if (poiAddress) info.address = String(poiAddress);
+    } catch (err) {
+      console.warn('tiktok page parse failed', err);
+    }
+  }
+
+  if (!caption && !images.length && !info.name) return null;
+
+  // 説明文に「営業時間」「住所」などが書かれていることが多いので拾う
+  const fromCaption = parseCaption_(caption);
+  Object.keys(fromCaption).forEach((k) => {
+    if (!info[k]) info[k] = fromCaption[k];
+  });
+  const plain = caption.replace(/[#＃]\S+/g, '').replace(/\s+/g, ' ').trim();
+  if (plain) info.summary = plain.slice(0, 600); // AI補完があれば紹介文は AI のものが優先される
+  if (!info.name) info.name = guessShopName_(caption) || `TikTok @${m[1]} の投稿`;
+
+  return {
+    url: resolved.split('?')[0],
+    info: info,
+    links: [{ type: 'tiktok', label: 'TikTok', url: resolved.split('?')[0] }],
+    images: dedupe_(images).slice(0, 8),
+  };
+}
+
+function resolveUrl_(url) {
+  let current = url;
+  for (let i = 0; i < 6; i++) {
+    let res;
+    try {
+      res = UrlFetchApp.fetch(current, { muteHttpExceptions: true, followRedirects: false, headers: { 'User-Agent': UA } });
+    } catch (err) {
+      return current;
+    }
+    const code = res.getResponseCode();
+    const loc = code >= 300 && code < 400 ? header_(res, 'Location') : null;
+    if (!loc) return current;
+    current = absUrl_(loc, current);
+  }
+  return current;
+}
+
+// 説明文の中から店名らしい部分（Cafe・珈琲・ベーカリー等を含む短い区切り）を探す
+function guessShopName_(caption) {
+  const text = String(caption || '').replace(/[#＃]\S+/g, ' ');
+  const segments = text
+    .split(/[\n・|｜↓→▶︎►●■◆★☆!！]|-{3,}|［[^］]*］|\[[^\]]*\]|[（(][^）)]*[）)]|\s{2,}/)
+    .map((x) => x.replace(/【[^】]*】/g, ' ').replace(/^[\s📍🏠☕️]+|[\s:：]+$/g, '').trim())
+    .filter((x) => x.length >= 3 && x.length <= 40);
+  const re = /(cafe|café|coffee|bakery|bake|roaster|kitchen|tea|patisserie|珈琲|コーヒー|喫茶|カフェ|ベーカリー|パン|茶房|甘味|パティスリー|ロースター)/i;
+  const hit = segments.find((x) => re.test(x) && !/^(カフェ|cafe|coffee)$/i.test(x) && !/(巡り|好き|行きたい|おすすめ|評価|見つけ|最高|です|ます|でした|だった|しい)/.test(x));
+  return hit || '';
+}
+
+// SNS の説明文から「［住所］〜」「📍〜」「営業時間：〜」のような項目を取り出す
+function parseCaption_(text) {
+  const t = String(text || '').replace(/[ \t\u3000]+/g, ' ');
+  const labels = {
+    name: '店名|店舗名|お店',
+    address: '住所|所在地|場所',
+    hours: '営業時間|営業',
+    holidays: '定休日|休み|店休日',
+    access: 'アクセス|最寄り駅|最寄駅|最寄り',
+    price: '予算|価格|値段',
+  };
+  const allLabels = Object.keys(labels).map((k) => labels[k]).join('|');
+  const out = {};
+  Object.keys(labels).forEach((k) => {
+    const re = new RegExp(
+      `[［\\[【〈<(（]?\\s*(?:${labels[k]})\\s*[］\\]】〉>)）]?\\s*[:：]?\\s*` +
+      `(.+?)` +
+      `(?=\\s*(?:[［\\[【〈<]|[#＃]|📍|⏰|🕐|💤|🚃|🚶|💰|🏠|(?:${allLabels})\\s*[:：］\\]】])|\\n|$)`,
+    );
+    const m = re.exec(t);
+    if (m && m[1].trim().length > 1) out[k] = m[1].trim().slice(0, 200);
+  });
+  return out;
+}
+
 function collectTabelogPhotos_(html, storeName) {
   const out = [];
   for (const m of html.matchAll(/<img[^>]+>/gi)) {
@@ -689,7 +819,16 @@ function dayJa_(d) {
 }
 
 function guessArea_(address) {
-  const m = /(?:東京都|北海道|(?:京都|大阪)府|.{2,3}県)?\s*([^\s\d０-９]{1,6}?[市区町村])/.exec(address);
+  const a = String(address)
+    .replace(/〒?\s*\d{3}-?\d{4}/, '')
+    .replace(/^\s*(東京都|北海道|(?:京都|大阪)府|[^\s\d０-９]{2,3}県)\s*/, '')
+    .trim();
+  // 政令指定都市は「大阪市中央区」、それ以外は最初の市区町村
+  const ward = /^([^\s\d０-９]{1,5}市)\s*([^\s\d０-９]{1,4}区)/.exec(a);
+  if (ward) return ward[1] + ward[2];
+  const gun = /^[^\s\d０-９]{1,5}郡\s*([^\s\d０-９]{1,5}?[町村])/.exec(a);
+  if (gun) return gun[1];
+  const m = /^([^\s\d０-９]{1,6}?[市区町村])/.exec(a);
   return m ? m[1] : undefined;
 }
 
