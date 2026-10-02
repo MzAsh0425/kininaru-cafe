@@ -1,4 +1,5 @@
 import { API_URL } from "./config.js";
+import { createCafeMap } from "./map.js";
 
 const configured = /^https?:\/\//.test(API_URL) && !API_URL.includes("/XXXX/");
 
@@ -30,6 +31,11 @@ const ICONS = {
   plus: `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>`,
   clock: `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>`,
   cup: `<svg viewBox="0 0 24 24" width="40" height="40" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9h13v5a5 5 0 0 1-5 5H9a5 5 0 0 1-5-5V9z"/><path d="M17 11h1.5a2.5 2.5 0 0 1 0 5H17"/><path d="M8 3c0 1.5 1 1.5 1 3M12 3c0 1.5 1 1.5 1 3"/></svg>`,
+  list: `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M8 6h12M8 12h12M8 18h12"/><circle cx="4" cy="6" r="1" fill="currentColor"/><circle cx="4" cy="12" r="1" fill="currentColor"/><circle cx="4" cy="18" r="1" fill="currentColor"/></svg>`,
+  map: `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 4L3 6.5v13L9 17l6 2.5 6-2.5V4l-6 2.5L9 4z"/><path d="M9 4v13M15 6.5v13"/></svg>`,
+  locate: `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/></svg>`,
+  fit: `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>`,
+  chevron: `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg>`,
   close: `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>`,
   left: `<svg class="icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round"><path d="M15 18l-6-6 6-6"/></svg>`,
 };
@@ -41,6 +47,8 @@ const state = {
   filter: safeGet(FILTER_KEY) ?? "all",
   loaded: false,
   listScroll: 0,
+  mapView: null, // 地図の表示位置（詳細から戻ったときに復元する）
+  geocodeRequested: false,
   lastSnapshot: "",
 };
 
@@ -144,11 +152,12 @@ async function hashPassphrase(pass) {
 function route() {
   const m = location.hash.match(/^#\/c\/([0-9a-f-]+)(\/edit)?$/);
   if (m) return { name: m[2] ? "edit" : "detail", id: m[1] };
+  if (location.hash === "#/map") return { name: "map" };
   return { name: "list" };
 }
 
 let currentRoute = null;
-let detailFromList = false;
+let detailFromList = false; // 一覧または地図から詳細に来たか（戻るボタンで履歴を戻る）
 
 function render(navigated) {
   if (!state.session) return renderLogin();
@@ -157,9 +166,14 @@ function render(navigated) {
   currentRoute = r;
 
   if (prev?.name === "list" && r.name !== "list") state.listScroll = window.scrollY;
-  if (navigated && r.name === "detail" && prev?.name !== "detail") detailFromList = prev?.name === "list";
+  if (navigated && r.name === "detail" && prev?.name !== "detail") detailFromList = prev?.name === "list" || prev?.name === "map";
+  if (prev?.name === "map" && r.name !== "map") destroyMap();
 
-  if (r.name === "list") {
+  if (r.name === "map") {
+    // ポーリングでの更新時は地図を作り直さず、ピンだけ更新する
+    if (!navigated && cafeMap) updateMapPage();
+    else renderMapPage();
+  } else if (r.name === "list") {
     renderList();
     if (navigated) window.scrollTo(0, prev && prev.name !== "list" ? state.listScroll : 0);
   } else if (r.name === "detail") {
@@ -234,22 +248,27 @@ function logout() {
 // ---------------------------------------------------------------------------
 // 一覧
 // ---------------------------------------------------------------------------
-function renderList() {
+function filteredCafes() {
+  const cafes = state.cafes;
+  if (state.filter === "visited") return cafes.filter((c) => c.visited);
+  if (state.filter === "todo") return cafes.filter((c) => !c.visited);
+  if (state.filter !== "all") return cafes.filter((c) => c.member_id === state.filter);
+  return cafes;
+}
+
+function topbarHtml(view) {
   const me = member(state.session.memberId);
   const others = state.members.filter((m) => m.id !== state.session.memberId);
-
-  let cafes = state.cafes;
-  if (state.filter === "visited") cafes = cafes.filter((c) => c.visited);
-  else if (state.filter === "todo") cafes = cafes.filter((c) => !c.visited);
-  else if (state.filter !== "all") cafes = cafes.filter((c) => c.member_id === state.filter);
-
   const seg = (id, label, color) =>
     `<button class="seg ${state.filter === id ? "active" : ""}" data-filter="${h(id)}">${color ? `<span class="dot" style="background:${h(color)}"></span>` : ""}${h(label)}</button>`;
-
-  app.innerHTML = `
+  return `
     <header class="topbar">
       <div class="topbar-row">
         <h1>きになるカフェ</h1>
+        <div class="view-switch" role="tablist">
+          <button class="${view === "list" ? "active" : ""}" data-view="list" aria-label="リスト">${ICONS.list}</button>
+          <button class="${view === "map" ? "active" : ""}" data-view="map" aria-label="マップ">${ICONS.map}</button>
+        </div>
         <button class="me-chip" id="me-chip"><span class="dot" style="background:${h(me?.color ?? "#999")}"></span>${h(me?.name ?? "")}</button>
       </div>
       <nav class="segments">
@@ -259,19 +278,42 @@ function renderList() {
         ${seg("todo", "まだ行ってない")}
         ${seg("visited", "行った")}
       </nav>
-    </header>
+    </header>`;
+}
+
+function bindTopbar(onFilterChange) {
+  app.querySelectorAll("[data-filter]").forEach((b) =>
+    b.addEventListener("click", () => {
+      state.filter = b.dataset.filter;
+      safeSet(FILTER_KEY, state.filter);
+      app.querySelectorAll("[data-filter]").forEach((x) => x.classList.toggle("active", x === b));
+      onFilterChange();
+    })
+  );
+  app.querySelectorAll("[data-view]").forEach((b) =>
+    b.addEventListener("click", () => {
+      const hash = b.dataset.view === "map" ? "#/map" : "#";
+      if (location.hash !== hash && !(hash === "#" && location.hash === "")) {
+        // リスト⇔マップの切り替えは履歴を増やさない
+        history.replaceState(null, "", location.pathname + location.search + hash);
+        render(true);
+      }
+    })
+  );
+  document.getElementById("me-chip").addEventListener("click", openProfileSheet);
+  document.getElementById("fab").addEventListener("click", () => openAddSheet());
+}
+
+function renderList() {
+  const cafes = filteredCafes();
+  app.innerHTML = `
+    ${topbarHtml("list")}
     <main class="list">
       ${cafes.length ? cafes.map(cardHtml).join("") : emptyHtml()}
     </main>
     <button class="fab" id="fab">${ICONS.plus}カフェを追加</button>`;
 
-  app.querySelectorAll("[data-filter]").forEach((b) =>
-    b.addEventListener("click", () => {
-      state.filter = b.dataset.filter;
-      safeSet(FILTER_KEY, state.filter);
-      renderList();
-    })
-  );
+  bindTopbar(renderList);
   app.querySelectorAll(".card[data-id]").forEach((el) =>
     el.addEventListener("click", (e) => {
       if (e.target.closest("[data-action]")) return;
@@ -296,8 +338,150 @@ function renderList() {
       removeCafe(b.dataset.id);
     })
   );
-  document.getElementById("fab").addEventListener("click", () => openAddSheet());
-  document.getElementById("me-chip").addEventListener("click", openProfileSheet);
+}
+
+// ---------------------------------------------------------------------------
+// 地図
+// ---------------------------------------------------------------------------
+let cafeMap = null;
+let mapToken = 0;
+let selectedOnMap = null;
+
+function mapItems() {
+  return filteredCafes()
+    .filter((c) => c.lat != null && c.lng != null)
+    .map((c) => ({
+      id: c.id,
+      lat: c.lat,
+      lng: c.lng,
+      color: member(c.member_id)?.color ?? "#999",
+      photo: thumb((c.photos ?? [])[0], 120),
+      visited: !!c.visited,
+    }));
+}
+
+function renderMapPage() {
+  destroyMap();
+  const token = ++mapToken;
+  app.innerHTML = `
+    <div class="map-page" id="map-page">
+      ${topbarHtml("map")}
+      <div class="map-wrap">
+        <div id="map" class="map-canvas"><div class="map-loading"><div class="spinner"></div></div></div>
+        <button class="map-chip" id="map-missing" hidden></button>
+        <div class="map-buttons">
+          <button class="map-btn" id="map-fit" aria-label="全体を表示">${ICONS.fit}</button>
+          <button class="map-btn" id="map-locate" aria-label="現在地">${ICONS.locate}</button>
+        </div>
+        <div class="map-preview" id="map-preview" hidden></div>
+      </div>
+      <button class="fab" id="fab">${ICONS.plus}カフェを追加</button>
+    </div>`;
+
+  bindTopbar(updateMapPage);
+  document.getElementById("map-fit").addEventListener("click", () => cafeMap?.fit());
+  document.getElementById("map-locate").addEventListener("click", locateMe);
+  document.getElementById("map-missing").addEventListener("click", () =>
+    toast("住所が分かると地図に表示されます。編集から住所を入れてください")
+  );
+
+  createCafeMap(document.getElementById("map"), {
+    initialView: state.mapView,
+    onSelect: (id) => selectOnMap(id),
+    onBackgroundTap: () => selectOnMap(null),
+  })
+    .then((m) => {
+      // 地図の読み込み中に別の画面へ移動していたら捨てる
+      if (token !== mapToken) return m.destroy();
+      cafeMap = m;
+      document.querySelector(".map-loading")?.remove();
+      updateMapPage();
+      if (selectedOnMap && cafe(selectedOnMap)) selectOnMap(selectedOnMap);
+      requestGeocodeIfNeeded();
+    })
+    .catch((e) => {
+      console.error(e);
+      const el = document.getElementById("map");
+      if (el) el.innerHTML = `<div class="empty"><p>地図を読み込めませんでした</p></div>`;
+    });
+}
+
+function updateMapPage() {
+  if (!cafeMap) return;
+  const items = mapItems();
+  cafeMap.update(items);
+  const segAll = app.querySelector('[data-filter="all"]');
+  if (segAll) segAll.textContent = `すべて ${state.cafes.length}`;
+  const missing = filteredCafes().filter((c) => c.status === "done" && (c.lat == null || c.lng == null)).length;
+  const chip = document.getElementById("map-missing");
+  if (chip) {
+    chip.hidden = missing === 0;
+    chip.textContent = `位置不明 ${missing}件`;
+  }
+  if (selectedOnMap && !items.some((i) => i.id === selectedOnMap)) selectOnMap(null);
+  else if (selectedOnMap) renderPreview(selectedOnMap);
+}
+
+function selectOnMap(id) {
+  selectedOnMap = id;
+  const preview = document.getElementById("map-preview");
+  document.getElementById("map-page")?.classList.toggle("previewing", !!id);
+  if (!id) {
+    cafeMap?.select(null);
+    if (preview) preview.hidden = true;
+    return;
+  }
+  renderPreview(id);
+  cafeMap?.select(id, { bottomInset: preview?.offsetHeight ?? 0 });
+}
+
+function renderPreview(id) {
+  const c = cafe(id);
+  const preview = document.getElementById("map-preview");
+  if (!c || !preview) return;
+  const m = member(c.member_id);
+  const photo = thumb((c.photos ?? [])[0], 240);
+  const meta = [c.area, c.genre].filter(Boolean).join("・");
+  preview.style.setProperty("--member", m?.color ?? "#999");
+  preview.innerHTML = `
+    ${photo ? `<img src="${h(photo)}" alt="" referrerpolicy="no-referrer">` : `<div class="noimg">${ICONS.cup}</div>`}
+    <div class="body">
+      <div class="who"><span class="dot"></span>${h(m?.name ?? "")}${c.visited ? `<span class="visited">✓ 行った</span>` : ""}</div>
+      <div class="name">${h(c.name || "名称未設定")}</div>
+      ${meta ? `<div class="meta">${h(meta)}</div>` : ""}
+      ${c.memo ? `<div class="memo">${h(c.memo)}</div>` : ""}
+    </div>
+    <span class="chev">${ICONS.chevron}</span>`;
+  preview.hidden = false;
+  preview.onclick = () => go(`#/c/${id}`);
+}
+
+function destroyMap() {
+  mapToken++;
+  if (!cafeMap) return;
+  state.mapView = cafeMap.getView();
+  cafeMap.destroy();
+  cafeMap = null;
+}
+
+function locateMe() {
+  if (!navigator.geolocation) return toast("現在地を取得できません");
+  navigator.geolocation.getCurrentPosition(
+    (pos) => cafeMap?.showMe(pos.coords.latitude, pos.coords.longitude),
+    () => toast("現在地を取得できませんでした（位置情報の許可を確認してください）"),
+    { enableHighAccuracy: true, timeout: 10000 }
+  );
+}
+
+// 住所はあるのに座標がないカフェがあれば、地図を開いたときにサーバーで補完してもらう
+function requestGeocodeIfNeeded() {
+  if (state.geocodeRequested) return;
+  const missing = state.cafes.some((c) => c.status === "done" && c.address && (c.lat == null || c.lng == null));
+  if (!missing) return;
+  state.geocodeRequested = true;
+  rpc("geocode_missing", { p_key: state.session.key })
+    .then((r) => (r?.updated ? refresh() : null))
+    .catch((e) => console.warn("geocode failed", e));
 }
 
 function emptyHtml() {
@@ -339,7 +523,7 @@ function cardHtml(c) {
 
   const photos = (c.photos ?? []).slice(0, 3);
   const thumbs = photos.length
-    ? `<div class="thumbs n${photos.length}">${photos.map((p) => `<img src="${h(p)}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.style.visibility='hidden'">`).join("")}</div>`
+    ? `<div class="thumbs n${photos.length}">${photos.map((p, i) => `<img src="${h(thumb(p, i === 0 ? 800 : 400))}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.style.visibility='hidden'">`).join("")}</div>`
     : `<div class="no-photo">${ICONS.cup}</div>`;
   const meta = [c.area, c.genre].filter(Boolean).join("・");
   // 曜日だけの行ではなく、時刻を含む最初の行を表示する
@@ -588,7 +772,7 @@ function renderDetail(id) {
         ${busy ? `<div class="notice info-notice"><div class="spinner" style="width:18px;height:18px;border-width:2px"></div>情報を収集中です。まとまり次第表示されます。</div>` : ""}
         ${c.status === "error" ? `<div class="notice">情報の取得に失敗しました: ${h(c.error ?? "")}</div>` : ""}
         ${c.status === "done" && c.error ? `<div class="notice info-notice">${h(c.error)}</div>` : ""}
-        ${photos.length ? `<div class="gallery ${photos.length === 1 ? "single" : ""}">${photos.map((p) => `<img src="${h(p)}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.remove()">`).join("")}</div>` : ""}
+        ${photos.length ? `<div class="gallery ${photos.length === 1 ? "single" : ""}">${photos.map((p) => `<img src="${h(thumb(p, 1200))}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.remove()">`).join("")}</div>` : ""}
         <div class="head">
           <span class="who"><span class="dot"></span>${h(m?.name ?? "")} が共有</span>
           <h1>${h(c.name || "名称未設定")}</h1>
@@ -721,7 +905,7 @@ function renderEdit(id) {
   const renderPhotos = () => {
     photosEl.innerHTML = draft.photos.map((p, i) => `
       <div class="edit-photo">
-        <img src="${h(p)}" alt="" referrerpolicy="no-referrer">
+        <img src="${h(thumb(p, 400))}" alt="" referrerpolicy="no-referrer">
         <button type="button" class="remove" data-remove="${i}" aria-label="削除">${ICONS.close}</button>
         ${i > 0 ? `<div class="order"><button type="button" data-first="${i}" aria-label="先頭へ">${ICONS.left}</button></div>` : ""}
       </div>`).join("") + `
@@ -941,6 +1125,12 @@ function replaceCafe(c) {
   const i = state.cafes.findIndex((x) => x.id === c.id);
   if (i >= 0) state.cafes[i] = c;
   else state.cafes.unshift(c);
+}
+
+// ドライブに保存した写真は URL 末尾のサイズ指定で縮小版を取得できる（通信量削減・ピンでのぼやけ防止）
+function thumb(url, size) {
+  if (!url) return null;
+  return /^https:\/\/lh3\.googleusercontent\.com\/d\/[^=/?]+$/.test(url) ? `${url}=w${size}` : url;
 }
 
 function h(s) {

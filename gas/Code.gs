@@ -106,6 +106,8 @@ function handle_(req) {
       return patchCafe_(room.id, req.p_id, { status: 'pending', error: '' });
     case 'process':
       return processById_(room.id, req.p_id);
+    case 'geocode_missing':
+      return geocodeMissing_(room.id, 10);
     case 'upload_photo':
       return uploadPhoto_(room.id, req.p_id, req.p_data);
     default:
@@ -227,6 +229,15 @@ function updateCafe_(roomId, id, patch) {
   if ('visited' in patch) clean.visited = !!patch.visited;
   if ('lat' in patch) clean.lat = patch.lat === '' || patch.lat == null ? '' : Number(patch.lat);
   if ('lng' in patch) clean.lng = patch.lng === '' || patch.lng == null ? '' : Number(patch.lng);
+  // 住所が変わったら地図用の座標を引き直す（クライアントから座標が明示されていればそれを使う）
+  if ('address' in clean && !('lat' in patch && patch.lat !== '' && patch.lat != null)) {
+    const current = findCafe_(roomId, id);
+    if (current && clean.address !== String(current.address || '')) {
+      const pos = clean.address ? geocode_(clean.address) : null;
+      clean.lat = pos ? pos.lat : '';
+      clean.lng = pos ? pos.lng : '';
+    }
+  }
   return patchCafe_(roomId, id, clean);
 }
 
@@ -324,6 +335,57 @@ function processPending() {
     if (Date.now() > deadline) break;
     processById_(c.room_id, c.id);
   }
+  // 住所はあるのに座標がないもの（手入力・以前のデータ）を補完する
+  if (Date.now() < deadline) geocodeMissing_(null, 20);
+}
+
+// ===========================================================================
+// 地図用の座標（Apps Script 内蔵のジオコーダ。APIキー不要）
+// ===========================================================================
+function geocodeMissing_(roomId, limit) {
+  const targets = readAll_('cafes')
+    .filter((c) => (!roomId || c.room_id === roomId) && c.status !== 'pending' && c.status !== 'processing')
+    .filter((c) => c.address && (c.lat === '' || c.lat == null) && c.lat !== 'none')
+    .slice(0, limit);
+  let updated = 0;
+  targets.forEach((c) => {
+    const pos = geocode_(c.address);
+    withLock_(() => {
+      const current = findCafe_(c.room_id, c.id);
+      if (!current || current.address !== c.address) return;
+      // 見つからなかった住所は 'none' を入れて毎回の再検索を避ける（住所を直すと再検索される）
+      current.lat = pos ? pos.lat : 'none';
+      current.lng = pos ? pos.lng : 'none';
+      write_('cafes', current._row, current);
+      if (pos) updated++;
+    });
+  });
+  return { updated: updated, checked: targets.length };
+}
+
+function geocode_(address) {
+  // 「(JR難波駅から徒歩4分)」のような補足・郵便番号・ビル名や階数は検索の邪魔になることがあるので、
+  // 段階的に削りながら検索する
+  const base = String(address)
+    .replace(/[（(][^）)]*[）)]/g, ' ')
+    .replace(/〒?\s*\d{3}-?\d{4}/, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!base) return null;
+  const candidates = [base];
+  // 番地（例: ２丁目６−７、1-5、27番地）までで切って、後ろのビル名・階数を除く
+  const block = /^(.*?[0-9０-９]+(?:\s*[-−‐－ー丁目番地号の]+\s*[0-9０-９]+)*(?:番地|番|号)?)/.exec(base);
+  if (block && block[1] !== base) candidates.push(block[1].trim());
+  for (const query of candidates) {
+    try {
+      const res = Maps.newGeocoder().setLanguage('ja').setRegion('jp').geocode(query);
+      const loc = res && res.status === 'OK' && res.results[0] && res.results[0].geometry.location;
+      if (loc) return { lat: loc.lat, lng: loc.lng };
+    } catch (err) {
+      console.warn('geocode failed', query, err);
+    }
+  }
+  return null;
 }
 
 function processCafe_(cafe) {
@@ -370,6 +432,14 @@ function processCafe_(cafe) {
       });
     });
     if (!info.area && info.address) info.area = guessArea_(info.address);
+    // 地図用の座標がページから取れなかったら住所から求める
+    if ((info.lat == null || info.lng == null) && info.address && !cafe.lat) {
+      const pos = geocode_(info.address);
+      if (pos) {
+        info.lat = pos.lat;
+        info.lng = pos.lng;
+      }
+    }
 
     // 写真: 食べログ → HP → 元ページ の順に集めて保存
     const candidates = dedupe_([].concat.apply([], ordered.map((p) => p.images)).concat(ai ? ai.imageUrls : []))
@@ -383,7 +453,7 @@ function processCafe_(cafe) {
       const current = findCafe_(cafe.room_id, cafe.id);
       if (!current) return; // 処理中に削除された
       INFO_FIELDS.forEach((k) => {
-        if (info[k] !== undefined && (current[k] === '' || current[k] == null)) current[k] = info[k];
+        if (info[k] !== undefined && (current[k] === '' || current[k] == null || current[k] === 'none')) current[k] = info[k];
       });
       current.links = dedupeLinks_(parseJsonArray_(current.links).concat(links));
       current.photos = dedupe_(parseJsonArray_(current.photos).concat(photos)).slice(0, 12);
