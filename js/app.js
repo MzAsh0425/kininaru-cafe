@@ -500,19 +500,30 @@ function cardHtml(c) {
 
   if (c.status === "pending" || c.status === "processing" || (c.status === "error" && !c.name)) {
     const isError = c.status === "error";
-    const stale = isStale(c);
+    // 食べログ等が一時的に取れず、サーバーの定期処理で自動再取得を待っている状態
+    const waiting = c.status === "pending" && /^再取得待ち/.test(c.error ?? "");
+    const stale = isStale(c) && (!waiting || Date.now() - new Date(c.updated_at).getTime() > 20 * 60 * 1000);
+    const showActions = isError || stale || waiting;
+    const stateText = isError
+      ? "情報を取得できませんでした"
+      : stale
+        ? "処理が止まっているようです"
+        : waiting
+          ? "混み合っているため、数分後に自動で再取得します"
+          : "情報を収集中…";
     return `
       <article class="card pending ${isError ? "error" : ""}" style="${style}" data-id="${h(c.id)}">
         ${isError ? `<div class="no-photo">${ICONS.cup}</div>` : `<div class="shimmer"></div>`}
         <div class="body">
-          ${isError || stale ? "" : `<div class="spinner"></div>`}
+          ${showActions ? "" : `<div class="spinner"></div>`}
           <div style="min-width:0;flex:1">
             ${who}
-            <div class="state">${isError ? "情報を取得できませんでした" : stale ? "処理が止まっているようです" : "情報を収集中…"}</div>
+            <div class="state">${stateText}</div>
+            ${(isError || waiting) && c.error ? `<div class="reason">${h(c.error)}</div>` : ""}
             <div class="url">${h(c.source_url)}</div>
             ${memoHtml(c)}
-            ${isError || stale ? `<div class="actions">
-              <button class="btn small ghost" data-action="retry" data-id="${h(c.id)}">再試行</button>
+            ${showActions ? `<div class="actions">
+              <button class="btn small ghost" data-action="retry" data-id="${h(c.id)}">${waiting ? "今すぐ再試行" : "再試行"}</button>
               <button class="btn small ghost" data-action="edit" data-id="${h(c.id)}">手動で入力</button>
               <button class="btn small danger" data-action="delete" data-id="${h(c.id)}">削除</button>
             </div>` : ""}

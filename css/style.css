@@ -267,6 +267,7 @@ input:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: 
 }
 @keyframes shimmer { from { background-position: 100% 0; } to { background-position: -100% 0; } }
 .card.error .state { color: var(--danger); }
+.card.pending .reason { font-size: 12px; color: var(--text-3); margin-top: 2px; word-break: break-all; }
 .card .actions { display: flex; gap: 8px; margin-top: 10px; }
 
 .empty {
