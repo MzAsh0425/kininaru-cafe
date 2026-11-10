@@ -6,7 +6,8 @@ const configured = /^https?:\/\//.test(API_URL) && !API_URL.includes("/XXXX/");
 const SESSION_KEY = "cafe-share-session";
 const FILTER_KEY = "cafe-share-filter";
 const PALETTE = ["#E0694F", "#2F8F8B", "#7A5AC8", "#D39B1F", "#3F7FD1", "#C2527F"];
-const STALE_PENDING_MS = 60 * 1000;
+// 順番待ちが長くなることもあるので、待機中は長めに見る（サーバーの定期処理は5分おき）
+const STALE_PENDING_MS = 20 * 60 * 1000;
 const STALE_PROCESSING_MS = 7 * 60 * 1000;
 
 const LINK_STYLE = {
@@ -500,17 +501,23 @@ function cardHtml(c) {
 
   if (c.status === "pending" || c.status === "processing" || (c.status === "error" && !c.name)) {
     const isError = c.status === "error";
-    // 食べログ等が一時的に取れず、サーバーの定期処理で自動再取得を待っている状態
+    // 一時的な失敗（AIの回数制限など）で、サーバーが少し後に自動で再試行するのを待っている状態
     const waiting = c.status === "pending" && /^再取得待ち/.test(c.error ?? "");
-    const stale = isStale(c) && (!waiting || Date.now() - new Date(c.updated_at).getTime() > 20 * 60 * 1000);
+    const stale = isStale(c);
+    // 処理は1件ずつ順番に行われるので、自分より前に待っている件数を出す
+    const ahead = c.status === "pending" && !waiting
+      ? state.cafes.filter((x) => (x.status === "pending" || x.status === "processing") && x.created_at < c.created_at).length
+      : 0;
     const showActions = isError || stale || waiting;
     const stateText = isError
       ? "情報を取得できませんでした"
       : stale
         ? "処理が止まっているようです"
         : waiting
-          ? "混み合っているため、数分後に自動で再取得します"
-          : "情報を収集中…";
+          ? "少し時間をおいて自動で再取得します"
+          : c.status === "pending"
+            ? ahead ? `順番待ち中（前に${ahead}件）` : "まもなく情報を収集します"
+            : "情報を収集中…";
     return `
       <article class="card pending ${isError ? "error" : ""}" style="${style}" data-id="${h(c.id)}">
         ${isError ? `<div class="no-photo">${ICONS.cup}</div>` : `<div class="shimmer"></div>`}

@@ -16,10 +16,15 @@ const CONFIG = {
   PHOTO_FOLDER_NAME: 'きになるカフェ_写真',
   STALE_PENDING_MS: 2 * 60 * 1000,
   STALE_PROCESSING_MS: 7 * 60 * 1000,
-  // 1回の収集にかける時間の上限（Apps Script の実行時間上限 6 分に余裕を持たせる）
-  PROCESS_BUDGET_MS: 4.5 * 60 * 1000,
-  // 食べログ等が一時的に取得できなかったときの自動再取得の回数
+  // 1回の実行で処理キューを回す時間の上限（Apps Script の実行時間上限 6 分に余裕を持たせる）
+  QUEUE_BUDGET_MS: 4.5 * 60 * 1000,
+  // 1件の処理を始めるのに必要な残り時間（Gemini の調査に数十秒かかるため）
+  MIN_TIME_PER_CAFE_MS: 90 * 1000,
+  // 処理担当の実行が途中で止まったときに、次の実行が引き継げるようになるまでの時間
+  WORKER_LEASE_MS: 6.5 * 60 * 1000,
+  // 一時的な失敗（AIの回数制限など）の自動再試行の回数と間隔
   MAX_RETRIES: 3,
+  RETRY_DELAY_MS: 2 * 60 * 1000,
 };
 
 const PALETTE = ['#E0694F', '#2F8F8B', '#7A5AC8', '#D39B1F', '#3F7FD1', '#C2527F'];
@@ -43,9 +48,6 @@ const INFO_FIELDS = ['name', 'summary', 'genre', 'area', 'address', 'lat', 'lng'
 
 const UA =
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15';
-// 取得に失敗したときに切り替えて試す UA（スマホ版ページ）
-const UA_MOBILE =
-  'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1';
 const RETRY_PREFIX = '再取得待ち';
 
 // ===========================================================================
@@ -113,7 +115,8 @@ function handle_(req) {
     case 'reset_cafe':
       return patchCafe_(room.id, req.p_id, { status: 'pending', error: '' });
     case 'process':
-      return processById_(room.id, req.p_id);
+      // 個別に処理するのではなく、処理キューを動かす（すでに別の実行が処理中なら何もしない）
+      return runQueue_();
     case 'geocode_missing':
       return geocodeMissing_(room.id, 10);
     case 'upload_photo':
@@ -315,38 +318,83 @@ function parseJsonArray_(v) {
 // ===========================================================================
 // 情報収集
 // ===========================================================================
-function processById_(roomId, id) {
-  const started = withLock_(() => {
-    const c = findCafe_(roomId, id);
-    if (!c) throw new Error('cafe not found');
-    if (c.status === 'processing' && Date.now() - Date.parse(c.updated_at) < CONFIG.STALE_PROCESSING_MS) return null;
-    const retries = Number((new RegExp(RETRY_PREFIX + '\\((\\d+)/').exec(String(c.error || '')) || [])[1] || 0);
-    c.status = 'processing';
-    c.error = '';
-    c.updated_at = now_();
-    write_('cafes', c._row, c);
-    c._retries = retries;
-    return c;
+/**
+ * 処理キュー
+ * 追加されたカフェは pending になり、処理担当の実行（同時に1つだけ）が古い順に1件ずつ処理する。
+ * 一度にたくさん追加しても Gemini や外部サイトにアクセスが集中しないようにするため。
+ */
+function runQueue_(deadline) {
+  deadline = deadline || Date.now() + CONFIG.QUEUE_BUDGET_MS;
+  const props = PropertiesService.getScriptProperties();
+  const acquired = withLock_(() => {
+    const lease = Number(props.getProperty('WORKER_LEASE') || 0);
+    if (lease > Date.now()) return false; // 別の実行が処理中
+    props.setProperty('WORKER_LEASE', String(Date.now() + CONFIG.WORKER_LEASE_MS));
+    return true;
   });
-  if (started) processCafe_(started);
-  const latest = findCafe_(roomId, id);
-  return latest ? cafeOut_(latest) : null;
+  if (!acquired) return { running: true, processed: 0 };
+
+  let processed = 0;
+  try {
+    while (deadline - Date.now() > CONFIG.MIN_TIME_PER_CAFE_MS) {
+      const next = claimNextCafe_();
+      if (!next) break;
+      processCafe_(next, deadline);
+      processed++;
+      Utilities.sleep(1000); // 外部サービスへのアクセスに間隔をあける
+    }
+  } finally {
+    withLock_(() => props.deleteProperty('WORKER_LEASE'));
+  }
+  // 担当を降りる直前に追加されたカフェがあれば、取りこぼさないように続けて処理する
+  if (deadline - Date.now() > CONFIG.MIN_TIME_PER_CAFE_MS && hasClaimableCafe_()) {
+    processed += runQueue_(deadline).processed;
+  }
+  return { running: false, processed: processed };
 }
 
-/** 時間主導トリガー: 放置された pending / processing を拾って処理する */
-function processPending() {
-  const deadline = Date.now() + 4 * 60 * 1000;
-  const targets = readAll_('cafes').filter((c) => {
-    const age = Date.now() - Date.parse(c.updated_at);
-    return (c.status === 'pending' && age > CONFIG.STALE_PENDING_MS) ||
-      (c.status === 'processing' && age > CONFIG.STALE_PROCESSING_MS);
+function hasClaimableCafe_() {
+  const now = Date.now();
+  return readAll_('cafes').some((c) =>
+    c.status === 'pending' && (!isRetryWaiting_(c) || now - Date.parse(c.updated_at) > CONFIG.RETRY_DELAY_MS)
+  );
+}
+
+/** 次に処理するカフェを1件選んで processing にする */
+function claimNextCafe_() {
+  return withLock_(() => {
+    const now = Date.now();
+    const cafes = readAll_('cafes');
+    // 処理担当の実行が途中で止まって processing のまま残ったものは待機に戻す
+    cafes
+      .filter((c) => c.status === 'processing' && now - Date.parse(c.updated_at) > CONFIG.STALE_PROCESSING_MS)
+      .forEach((c) => {
+        c.status = 'pending';
+        write_('cafes', c._row, c);
+      });
+    const next = cafes
+      .filter((c) => c.status === 'pending')
+      // 一時的な失敗で再試行待ちのものは、少し時間をおいてから
+      .filter((c) => !isRetryWaiting_(c) || now - Date.parse(c.updated_at) > CONFIG.RETRY_DELAY_MS)
+      .sort((a, b) => (a.created_at < b.created_at ? -1 : 1))[0];
+    if (!next) return null;
+    next._retries = Number((new RegExp(RETRY_PREFIX + '\\((\\d+)/').exec(String(next.error || '')) || [])[1] || 0);
+    next.status = 'processing';
+    next.error = '';
+    next.updated_at = now_();
+    write_('cafes', next._row, next);
+    return next;
   });
-  for (const c of targets) {
-    if (Date.now() > deadline) break;
-    processById_(c.room_id, c.id);
-  }
-  // 住所はあるのに座標がないもの（手入力・以前のデータ）を補完する
-  if (Date.now() < deadline) geocodeMissing_(null, 20);
+}
+
+function isRetryWaiting_(c) {
+  return String(c.error || '').indexOf(RETRY_PREFIX) === 0;
+}
+
+/** 時間主導トリガー（5分おき）: 処理キューを動かし、座標のないカフェを補完する */
+function processPending() {
+  runQueue_();
+  geocodeMissing_(null, 20);
 }
 
 // ===========================================================================
@@ -398,30 +446,37 @@ function geocode_(address) {
   return null;
 }
 
-function processCafe_(cafe) {
-  const startedAt = Date.now();
-  const timeLeft = () => CONFIG.PROCESS_BUDGET_MS - (Date.now() - startedAt);
+function processCafe_(cafe, deadline) {
+  const timeLeft = () => deadline - Date.now();
   try {
     const sourceUrl = cafe.source_url;
+    const sourceType = classifyLink_(sourceUrl).type;
     const source = scrapePage_(sourceUrl);
     const sourceError = lastFetchError_;
     const pages = source ? [source] : [];
 
     const apiKey = PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY');
     let ai = null;
-    if (apiKey && timeLeft() > 120 * 1000) {
+    let aiError = '';
+    if (apiKey) {
       try {
         ai = researchWithGemini_(apiKey, sourceUrl, source, timeLeft);
+        if (!ai) aiError = 'AIの回答を読み取れませんでした';
       } catch (err) {
         console.error('gemini failed', err);
+        aiError = String((err && err.message) || err).slice(0, 200);
+        // 回数制限などの一時的な失敗で、ページからも何も取れていないなら後で再試行する
+        if (err instanceof RetryableError_ && !source) throw err;
       }
     }
 
-    // 食べログ・公式HPが一時的に取れず、AI でも補えなかったときは後で自動再取得する
-    const sourceType = classifyLink_(sourceUrl).type;
-    if (!source && ['tabelog', 'hp', 'retty', 'hotpepper'].indexOf(sourceType) >= 0 && !(ai && ai.info.name)) {
-      const label = sourceType === 'tabelog' ? '食べログ' : 'ページ';
-      throw new RetryableError_(`${label}を取得できませんでした（${sourceError || '不明なエラー'}）`);
+    // ページが読めず、AI でも店舗を特定できなかった
+    if (!source && !(ai && ai.info.name) && sourceType !== 'tiktok') {
+      const why = sourceType === 'tabelog'
+        ? '食べログはサーバーからの自動取得を受け付けていないため、AI（Gemini）の検索で調べます'
+        : `ページを取得できませんでした（${sourceError || '不明なエラー'}）`;
+      const aiMsg = apiKey ? `AIでも店舗を特定できませんでした（${aiError || '不明'}）` : 'Gemini APIキーが未設定です';
+      throw new Error(`${why}。${aiMsg}。「手動で入力」から店名などを入れてください`);
     }
 
     // AIが見つけた公式アカウント等を優先（共有元URL自体は source_url として別途表示する）
@@ -430,8 +485,8 @@ function processCafe_(cafe) {
     // 関連ページ（食べログ・公式HP）もスクレイピングして写真と情報を集める（時間に余裕があるときだけ）
     const scraped = pages.map((p) => normalizeUrl_(p.url));
     const extraTargets = links
-      .filter((l) => ['tabelog', 'hp', 'retty', 'hotpepper'].indexOf(l.type) >= 0)
-      .filter((l) => scraped.indexOf(normalizeUrl_(canonicalUrl_(l.url))) < 0)
+      .filter((l) => ['hp', 'retty', 'hotpepper'].indexOf(l.type) >= 0)
+      .filter((l) => scraped.indexOf(normalizeUrl_(l.url)) < 0)
       .slice(0, 3);
     extraTargets.forEach((l) => {
       if (timeLeft() < 60 * 1000) return;
@@ -479,20 +534,20 @@ function processCafe_(cafe) {
       current.links = dedupeLinks_(parseJsonArray_(current.links).concat(links));
       current.photos = dedupe_(parseJsonArray_(current.photos).concat(photos)).slice(0, 12);
       current.status = 'done';
-      current.error = ai || !apiKey ? '' : 'AIによる補完に失敗したため、ページ解析結果のみです';
+      current.error = ai || !apiKey ? '' : `AIによる補完に失敗したため、ページ解析結果のみです（${aiError}）`;
       current.processed_at = now_();
       current.updated_at = now_();
       write_('cafes', current._row, current);
     });
   } catch (err) {
     console.error('process failed', err);
-    const message = String((err && err.message) || err).slice(0, 300);
+    const message = String((err && err.message) || err).slice(0, 400);
     const retries = (cafe._retries || 0) + 1;
     withLock_(() => {
       const current = findCafe_(cafe.room_id, cafe.id);
       if (!current) return;
       if (err instanceof RetryableError_ && retries <= CONFIG.MAX_RETRIES) {
-        // 定期処理（5分おき）が拾って再取得する
+        // 少し時間をおいて処理キューが再び拾う
         current.status = 'pending';
         current.error = `${RETRY_PREFIX}(${retries}/${CONFIG.MAX_RETRIES}): ${message}`;
       } else {
@@ -523,22 +578,19 @@ function pageRank_(url) {
 let lastFetchError_ = '';
 
 function fetchHtml_(url) {
-  const first = fetchHtmlOnce_(url, UA);
-  if (first.ok) return first.result;
-  // 一時的なエラー（アクセス制限・混雑・通信エラー）は少し待ってスマホ版として取り直す
-  if (first.retryable) {
-    Utilities.sleep(1500);
-    const second = fetchHtmlOnce_(url, UA_MOBILE);
-    if (second.ok) return second.result;
-    lastFetchError_ = second.reason;
-  } else {
-    lastFetchError_ = first.reason;
+  let r = fetchHtmlOnce_(url);
+  // 混雑（429/5xx）や通信エラーなど一時的なものだけ、少し待って1回だけ再試行する
+  if (!r.ok && r.retryable) {
+    Utilities.sleep(2000);
+    r = fetchHtmlOnce_(url);
   }
+  if (r.ok) return r.result;
+  lastFetchError_ = r.reason;
   console.warn('fetch failed', url, lastFetchError_);
   return null;
 }
 
-function fetchHtmlOnce_(url, userAgent) {
+function fetchHtmlOnce_(url) {
   let current = url;
   for (let i = 0; i < 6; i++) {
     let res;
@@ -546,7 +598,7 @@ function fetchHtmlOnce_(url, userAgent) {
       res = UrlFetchApp.fetch(current, {
         muteHttpExceptions: true,
         followRedirects: false,
-        headers: { 'User-Agent': userAgent, 'Accept-Language': 'ja,en;q=0.8', Accept: 'text/html,*/*' },
+        headers: { 'User-Agent': UA, 'Accept-Language': 'ja,en;q=0.8', Accept: 'text/html,*/*' },
       });
     } catch (err) {
       return { ok: false, retryable: true, reason: '通信エラー: ' + String((err && err.message) || err).slice(0, 80) };
@@ -559,16 +611,12 @@ function fetchHtmlOnce_(url, userAgent) {
       continue;
     }
     if (code !== 200) {
-      return { ok: false, retryable: code === 403 || code === 429 || code >= 500, reason: `HTTP ${code}` };
+      // 403（アクセス拒否）は再試行しない
+      return { ok: false, retryable: code === 429 || code >= 500, reason: `HTTP ${code}` };
     }
     const ct = header_(res, 'Content-Type') || '';
     if (!/html/i.test(ct)) return { ok: false, retryable: false, reason: 'HTMLではありません' };
-    const html = decodeResponse_(res, ct);
-    // 食べログの「アクセスが集中しています」等の代替ページは失敗として扱う
-    if (classifyLink_(current).type === 'tabelog' && !/application\/ld\+json/i.test(html) && !/rstinfo-table|rdheader/i.test(html)) {
-      return { ok: false, retryable: true, reason: '食べログの代替ページ（アクセス制限の可能性）' };
-    }
-    return { ok: true, result: { html: html, finalUrl: current } };
+    return { ok: true, result: { html: decodeResponse_(res, ct), finalUrl: current } };
   }
   return { ok: false, retryable: false, reason: 'リダイレクトが多すぎます' };
 }
@@ -600,7 +648,13 @@ function scrapePage_(url) {
     const tiktok = scrapeTikTok_(url);
     if (tiktok) return tiktok;
   }
-  const res = fetchHtml_(canonicalUrl_(url));
+  // 食べログはクラウドのサーバーからのアクセスを拒否している（HTTP 403）ので取りに行かない。
+  // 店舗情報は Gemini の Google 検索で調べる。
+  if (classifyLink_(url).type === 'tabelog') {
+    lastFetchError_ = '食べログはサーバーからの取得を受け付けていません';
+    return null;
+  }
+  const res = fetchHtml_(url);
   if (!res) return null;
   const html = res.html;
   const finalUrl = res.finalUrl;
@@ -1100,9 +1154,12 @@ const CAFE_SCHEMA = {
 
 function researchWithGemini_(apiKey, sourceUrl, source, timeLeft) {
   const model = PropertiesService.getScriptProperties().getProperty('GEMINI_MODEL') || CONFIG.GEMINI_MODEL_DEFAULT;
+  const tabelog = /tabelog\.com\/(?:[a-z]{2}\/)?[a-z]+\/A\d+\/A\d+\/(\d+)/.exec(sourceUrl);
   const hints = source
     ? `\n\n参考: 共有URLを事前に解析した結果（不正確な場合あり）\n${JSON.stringify({ info: source.info, links: source.links }, null, 1).slice(0, 3000)}`
-    : '\n\n（共有URLは直接取得できませんでした。SNSなどの可能性があります）';
+    : tabelog
+      ? `\n\n（共有URLは食べログの店舗ページです。ページは直接読み込めないことがあるので、Google検索で「${canonicalUrl_(sourceUrl)}」や「食べログ ${tabelog[1]}」を調べて店舗を特定してください）`
+      : '\n\n（共有URLは直接取得できませんでした。SNSなどの可能性があります）';
   const prompt =
     `次のURLは友人が「気になるカフェ」として共有したものです。\n${sourceUrl}\n\n` +
     'このURLが指す店舗を特定し、Google検索とURLの読み込みで、公式サイト・食べログ・Instagram・X・Googleマップなどの関連リンクと、' +
@@ -1138,8 +1195,20 @@ function researchWithGemini_(apiKey, sourceUrl, source, timeLeft) {
     console.warn('gemini structured output rejected, retrying without schema', res.getContentText().slice(0, 500));
     res = call(body(false));
   }
-  if (res.getResponseCode() !== 200) {
-    throw new Error(`gemini ${res.getResponseCode()}: ${res.getContentText().slice(0, 300)}`);
+  // 回数制限（429）や混雑（503）は、指示された時間だけ待って1回だけ再試行する
+  if (res.getResponseCode() === 429 || res.getResponseCode() === 503) {
+    const wait = geminiRetryDelayMs_(res);
+    if (wait <= 30 * 1000 && timeLeft() - wait > 60 * 1000) {
+      Utilities.sleep(wait);
+      res = call(body(supportsStructured));
+    }
+  }
+  const code = res.getResponseCode();
+  if (code === 429 || code === 503) {
+    throw new RetryableError_(code === 429 ? 'AIの利用回数の上限に達しました' : 'AIが混み合っています');
+  }
+  if (code !== 200) {
+    throw new Error(`Gemini ${code}: ${geminiErrorMessage_(res)}`);
   }
   const data = JSON.parse(res.getContentText());
   const cand = (data.candidates || [])[0] || {};
@@ -1153,6 +1222,21 @@ function researchWithGemini_(apiKey, sourceUrl, source, timeLeft) {
     return null;
   }
   return toAiResult_(parsed, timeLeft);
+}
+
+function geminiRetryDelayMs_(res) {
+  const header = Number(header_(res, 'Retry-After'));
+  if (header > 0) return header * 1000;
+  const m = /"retryDelay":\s*"(\d+(?:\.\d+)?)s"/.exec(res.getContentText());
+  return m ? Math.ceil(Number(m[1]) * 1000) : 10 * 1000;
+}
+
+function geminiErrorMessage_(res) {
+  try {
+    return JSON.parse(res.getContentText()).error.message.slice(0, 160);
+  } catch (err) {
+    return res.getContentText().slice(0, 160);
+  }
 }
 
 function parseJsonLoose_(text) {
@@ -1198,6 +1282,8 @@ function toAiResult_(input, timeLeft) {
 }
 
 function urlExists_(url) {
+  // 食べログはサーバーからのアクセスを拒否しているので確認しない（店舗URLの形式なら採用）
+  if (classifyLink_(url).type === 'tabelog') return /tabelog\.com\/(?:[a-z]{2}\/)?[a-z]+\/A\d+\/A\d+\/\d+/.test(url);
   try {
     const res = UrlFetchApp.fetch(url, { muteHttpExceptions: true, followRedirects: true, headers: { 'User-Agent': UA } });
     // SNS はボット対策で 403 などを返すことがあるので、明確に存在しない場合だけ除外する
@@ -1353,9 +1439,23 @@ function now_() {
 // 診断用（エディタで関数を選んで実行し、「実行ログ」を見る）
 // ===========================================================================
 function testFetch() {
-  const url = 'https://tabelog.com/kyoto/A2601/A260201/26002519/'; // 確認したい URL に書き換えて実行
+  const url = 'https://www.bluebottlecoffee.jp/'; // 確認したい URL に書き換えて実行
   const res = fetchHtml_(url);
   console.log(res ? `取得成功: ${res.finalUrl}（${res.html.length}文字）` : `取得失敗: ${lastFetchError_}`);
   const page = scrapePage_(url);
   console.log(page ? JSON.stringify({ info: page.info, links: page.links, images: page.images.length }, null, 1) : '解析結果なし');
+}
+
+/** Gemini の設定確認（エディタで実行して「実行ログ」を見る） */
+function testGemini() {
+  const apiKey = PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY');
+  if (!apiKey) return console.log('GEMINI_API_KEY が未設定です');
+  const url = 'https://tabelog.com/kyoto/A2601/A260201/26002519/';
+  const started = Date.now();
+  try {
+    const r = researchWithGemini_(apiKey, url, null, () => 5 * 60 * 1000);
+    console.log(`${((Date.now() - started) / 1000).toFixed(1)}秒`, JSON.stringify(r, null, 1));
+  } catch (err) {
+    console.log('失敗:', err.message);
+  }
 }
