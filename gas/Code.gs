@@ -1168,12 +1168,13 @@ function researchWithGemini_(apiKey, sourceUrl, source, timeLeft) {
     'URLは検索結果や読み込んだページで実在を確認できたものだけを、正規のURL（リダイレクト用URLではなく）で入れてください。' +
     `結果は指定のJSON形式で返してください。${hints}`;
 
-  const body = (structured) => ({
-    contents: [{
-      role: 'user',
-      parts: [{ text: structured ? prompt : `${prompt}\n\nJSONのキー: ${CAFE_SCHEMA.required.join(', ')}。JSON以外は出力しないこと。` }],
-    }],
-    tools: [{ google_search: {} }, { url_context: {} }],
+  const isTabelog = classifyLink_(sourceUrl).type === 'tabelog';
+  const jsonRule = `\n\nJSONのキー: ${CAFE_SCHEMA.required.join(', ')}。JSON以外は出力しないこと。`;
+  // 食べログは Google からもページを読めないことが多く、url_context が失敗すると空の返答になるので検索だけ使う
+  const toolsFor = (useUrlContext) => (useUrlContext ? [{ google_search: {} }, { url_context: {} }] : [{ google_search: {} }]);
+  const body = (structured, useUrlContext, text) => ({
+    contents: [{ role: 'user', parts: [{ text: text || (structured ? prompt : prompt + jsonRule) }] }],
+    tools: toolsFor(useUrlContext),
     generationConfig: structured ? { responseMimeType: 'application/json', responseJsonSchema: CAFE_SCHEMA } : {},
   });
   const call = (payload) => UrlFetchApp.fetch(
@@ -1186,40 +1187,77 @@ function researchWithGemini_(apiKey, sourceUrl, source, timeLeft) {
       muteHttpExceptions: true,
     },
   );
+  // 回数制限（429）や混雑（503）は、指示された時間だけ待って1回だけ再試行する
+  const send = (payload) => {
+    let res = call(payload);
+    if (res.getResponseCode() === 429 || res.getResponseCode() === 503) {
+      const wait = geminiRetryDelayMs_(res);
+      if (wait <= 30 * 1000 && timeLeft() - wait > 60 * 1000) {
+        Utilities.sleep(wait);
+        res = call(payload);
+      }
+    }
+    const code = res.getResponseCode();
+    if (code === 429 || code === 503) {
+      throw new RetryableError_(code === 429 ? 'AIの利用回数の上限に達しました' : 'AIが混み合っています');
+    }
+    return res;
+  };
+  const textOf = (res) => {
+    const data = JSON.parse(res.getContentText());
+    const cand = (data.candidates || [])[0] || {};
+    const text = ((cand.content && cand.content.parts) || [])
+      .filter((p) => typeof p.text === 'string' && !p.thought)
+      .map((p) => p.text)
+      .join('')
+      .trim();
+    if (!text) {
+      console.warn('gemini returned empty text', model, cand.finishReason || '',
+        JSON.stringify(data.promptFeedback || {}), JSON.stringify(cand.urlContextMetadata || cand.url_context_metadata || {}).slice(0, 300));
+    }
+    return text;
+  };
 
   // Gemini 2.x は「検索ツール + JSON 形式指定」を同時に使えないので、最初から本文の JSON で受け取る
   const supportsStructured = !/^gemini-(1|2)\./.test(model);
-  let res = call(body(supportsStructured));
+  let useUrlContext = !isTabelog;
+  let res = send(body(supportsStructured, useUrlContext));
   // 構造化出力とツールの併用に対応していないモデルの場合は、テキストのJSONで受け取る
-  if (supportsStructured && res.getResponseCode() === 400) {
+  let structured = supportsStructured;
+  if (structured && res.getResponseCode() === 400) {
     console.warn('gemini structured output rejected, retrying without schema', res.getContentText().slice(0, 500));
-    res = call(body(false));
+    structured = false;
+    res = send(body(false, useUrlContext));
   }
-  // 回数制限（429）や混雑（503）は、指示された時間だけ待って1回だけ再試行する
-  if (res.getResponseCode() === 429 || res.getResponseCode() === 503) {
-    const wait = geminiRetryDelayMs_(res);
-    if (wait <= 30 * 1000 && timeLeft() - wait > 60 * 1000) {
-      Utilities.sleep(wait);
-      res = call(body(supportsStructured));
-    }
+  if (res.getResponseCode() !== 200) {
+    throw new Error(`Gemini ${res.getResponseCode()}: ${geminiErrorMessage_(res)}`);
   }
-  const code = res.getResponseCode();
-  if (code === 429 || code === 503) {
-    throw new RetryableError_(code === 429 ? 'AIの利用回数の上限に達しました' : 'AIが混み合っています');
+  let text = textOf(res);
+
+  // 空の返答（URL読み込みの失敗などで調べずに終わった）なら、検索だけでもう一度調べる
+  if (!text && timeLeft() > 60 * 1000) {
+    useUrlContext = false;
+    const retryPrompt = `${prompt}\n\n必ずGoogle検索を使って調べてから回答してください。URLのページ自体は読み込めなくても、検索結果から分かる範囲でまとめてください。`;
+    res = send(body(structured, false, structured ? retryPrompt : retryPrompt + jsonRule));
+    if (res.getResponseCode() !== 200) throw new Error(`Gemini ${res.getResponseCode()}: ${geminiErrorMessage_(res)}`);
+    text = textOf(res);
   }
-  if (code !== 200) {
-    throw new Error(`Gemini ${code}: ${geminiErrorMessage_(res)}`);
+  if (!text) throw new Error('AIから回答が得られませんでした');
+
+  let parsed = parseJsonLoose_(text);
+  // JSON ではなく文章で返ってきたときは、ツールなし（JSON形式指定あり）で JSON に変換し直す
+  if (!parsed && timeLeft() > 40 * 1000) {
+    console.warn('gemini returned non-json, converting', text.slice(0, 300));
+    const conv = send({
+      contents: [{ role: 'user', parts: [{ text: `次の調査結果を指定のJSON形式に変換してください。書かれていない項目は空文字（配列は空配列）にすること。\n\n${text.slice(0, 12000)}` }] }],
+      generationConfig: { responseMimeType: 'application/json', responseJsonSchema: CAFE_SCHEMA },
+    });
+    if (conv.getResponseCode() === 200) parsed = parseJsonLoose_(textOf(conv));
+    else console.warn('gemini json conversion failed', conv.getResponseCode(), geminiErrorMessage_(conv));
   }
-  const data = JSON.parse(res.getContentText());
-  const cand = (data.candidates || [])[0] || {};
-  const text = ((cand.content && cand.content.parts) || [])
-    .filter((p) => typeof p.text === 'string' && !p.thought)
-    .map((p) => p.text)
-    .join('');
-  const parsed = parseJsonLoose_(text);
   if (!parsed) {
-    console.warn('gemini returned no json', cand.finishReason, text.slice(0, 300));
-    return null;
+    console.warn('gemini returned no json', text.slice(0, 300));
+    throw new Error('AIの回答を読み取れませんでした');
   }
   return toAiResult_(parsed, timeLeft);
 }
@@ -1454,7 +1492,7 @@ function testGemini() {
   const started = Date.now();
   try {
     const r = researchWithGemini_(apiKey, url, null, () => 5 * 60 * 1000);
-    console.log(`${((Date.now() - started) / 1000).toFixed(1)}秒`, JSON.stringify(r, null, 1));
+    console.log(`モデル: ${PropertiesService.getScriptProperties().getProperty('GEMINI_MODEL') || CONFIG.GEMINI_MODEL_DEFAULT}  ${((Date.now() - started) / 1000).toFixed(1)}秒`, JSON.stringify(r, null, 1));
   } catch (err) {
     console.log('失敗:', err.message);
   }
