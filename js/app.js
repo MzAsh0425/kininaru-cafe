@@ -595,10 +595,6 @@ function openAddSheet(prefill = "") {
           <button type="button" class="btn ghost" id="paste-btn">ペースト</button>
         </div>
       </label>
-      <label class="field"><span>店名（任意）</span>
-        <input name="name" type="text" placeholder="入れると正確に調べられます" autocomplete="off" value="${h(shopNameFromShareText(prefill))}">
-        <small class="note" id="name-note" hidden>食べログのリンクだけでは別のお店と間違えることがあるので、店名を入れるのがおすすめです</small>
-      </label>
       <label class="field"><span>ひとことメモ（任意）</span>
         <textarea name="memo" rows="2" placeholder="例: モーニングが気になる"></textarea>
       </label>
@@ -608,22 +604,12 @@ function openAddSheet(prefill = "") {
   const form = el.querySelector("#add-form");
   // 1行の input だと貼り付け時に改行が消えて URL と後続の文字がつながるため textarea を使う
   const input = form.querySelector("textarea[name=url]");
-  const nameInput = form.querySelector("input[name=name]");
-  const nameNote = form.querySelector("#name-note");
   // URL 以外の部分（店名・電話番号など）は、お店を正しく特定する手がかりとしてサーバーに送る
   let shareText = prefill && extractUrl(prefill) !== prefill.trim() ? prefill : "";
-  const updateNameNote = () => {
-    nameNote.hidden = !(/tabelog\.com/.test(input.value) && !nameInput.value.trim());
-  };
-  // 共有テキストを取り込む（店名欄が空なら店名を入れる）
   const takeShareText = (text) => {
     const url = extractUrl(text);
-    if (!url || url === text.trim()) return;
-    shareText = text;
-    if (!nameInput.value.trim()) nameInput.value = shopNameFromShareText(text);
+    if (url && url !== text.trim()) shareText = text;
   };
-  nameInput.addEventListener("input", updateNameNote);
-  updateNameNote();
   if (!prefill) setTimeout(() => input.focus(), 300);
 
   // 食べログアプリ等の「店名・電話番号・URL」が混ざった共有テキストを貼っても URL だけにする
@@ -632,9 +618,8 @@ function openAddSheet(prefill = "") {
     const before = input.value;
     if (keepOnlyUrl(input)) {
       takeShareText(before);
-      toast(nameInput.value ? "URLと店名を取り出しました" : "URLだけを取り出しました");
+      toast("URLだけを取り出しました");
     }
-    updateNameNote();
   });
   el.querySelector("#paste-btn").addEventListener("click", async () => {
     try {
@@ -643,8 +628,7 @@ function openAddSheet(prefill = "") {
       if (url) {
         input.value = url;
         takeShareText(text);
-        if (url !== text.trim()) toast(nameInput.value ? "URLと店名を取り出しました" : "URLだけを取り出しました");
-        updateNameNote();
+        if (url !== text.trim()) toast("URLだけを取り出しました");
       } else toast("クリップボードにURLがありません");
     } catch {
       toast("入力欄を長押ししてペーストしてください");
@@ -655,11 +639,10 @@ function openAddSheet(prefill = "") {
     const url = extractUrl(input.value);
     if (!url) return toast("URLを入力してください");
     const memo = String(new FormData(form).get("memo") ?? "");
-    const name = nameInput.value.trim();
     const btn = form.querySelector("button[type=submit]");
     btn.disabled = true;
     try {
-      const cafe = await rpc("add_cafe", { p_key: state.session.key, p_member_id: state.session.memberId, p_url: url, p_memo: memo, p_name: name, p_hint: shareText });
+      const cafe = await rpc("add_cafe", { p_key: state.session.key, p_member_id: state.session.memberId, p_url: url, p_memo: memo, p_hint: shareText });
       state.cafes.unshift(cafe);
       close();
       if (route().name !== "list") go("#");
@@ -693,26 +676,6 @@ function extractUrl(text) {
 
 function count(s, ch) {
   return s.split(ch).length - 1;
-}
-
-// 共有テキスト（例: 食べログアプリの「店名 (駅/ジャンル)\nTEL\nURL」）から店名らしい行を取り出す
-function shopNameFromShareText(text) {
-  const t = String(text ?? "");
-  if (!extractUrl(t) || extractUrl(t) === t.trim()) return "";
-  const line = t
-    .replace(/https?:\/\/\S+/g, "\n")
-    .replace(/[#＃]\S+/g, " ")
-    .split("\n")
-    .map((x) => x.replace(/(?:TEL|電話)\s*[:：]?\s*[\d\-+() ]+/gi, "").trim())
-    .find((x) => x.length >= 2 && !/^[\d\-+() ]+$/.test(x));
-  if (!line) return "";
-  const name = line
-    .replace(/\s*[\[［【]?\s*食べログ\s*[\]］】]?\s*$/, "")
-    .replace(/\s*[-|｜]\s*(?:食べログ|Retty|ホットペッパー.*|Google.*)$/i, "")
-    .replace(/\s+[-|｜]\s+[^-|｜]*\/[^-|｜]*$/, "")
-    .replace(/\s*[（(][^（()）]*\/[^（()）]*[）)]\s*$/, "")
-    .trim();
-  return name.length >= 2 && name.length <= 60 ? name : "";
 }
 
 // 入力欄に URL 以外の文字が混ざっていたら URL だけにする。書き換えたら true
