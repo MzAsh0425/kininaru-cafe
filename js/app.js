@@ -1,5 +1,7 @@
 import { API_URL } from "./config.js";
 import { createCafeMap } from "./map.js";
+// 共有ボタンから追加する iPhone ショートカット（shortcut/ に置いた署名済みファイル）
+const SHORTCUT_URL = new URL("shortcut/きになるカフェに追加.shortcut", location.href).href;
 
 const configured = /^https?:\/\//.test(API_URL) && !API_URL.includes("/XXXX/");
 
@@ -732,8 +734,30 @@ function openProfileSheet() {
         </div>
       </div>
       <button class="btn block" type="submit" style="margin-top:8px">保存</button>
-      <button class="btn block danger" type="button" id="logout-btn" style="margin-top:8px">部屋から出る</button>
-    </form>`);
+    </form>
+    <section class="shortcut-box">
+      <h3>アプリの共有ボタンから追加する</h3>
+      <p>食べログ・Instagram・TikTok・Safari の共有ボタンから、そのままカフェを追加できる iPhone のショートカットです。食べログのページは iPhone で読み込むので、店名・住所・営業時間・写真まで正確に取れます。</p>
+      <ol>
+        <li>下の「コードをコピー」を押す</li>
+        <li>「ショートカットを入手」を押し、表示された画面で「ショートカットを追加」→ 聞かれたらコードを貼り付ける</li>
+        <li>各アプリの共有ボタン →「きになるカフェに追加」（初回は共有メニューの「その他」や「…」から）</li>
+      </ol>
+      <div class="row">
+        <button class="btn ghost" type="button" id="copy-code-btn">コードをコピー</button>
+        <a class="btn" href="${SHORTCUT_URL}" id="get-shortcut">ショートカットを入手</a>
+      </div>
+      <p class="fine">コードは合言葉と同じく部屋に入るための情報なので、他の人には教えないでください。</p>
+    </section>
+    <button class="btn block danger" type="button" id="logout-btn" style="margin-top:16px">部屋から出る</button>`);
+  el.querySelector("#copy-code-btn").addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText(`${state.session.memberId}.${state.session.key}`);
+      toast("コードをコピーしました");
+    } catch {
+      toast("コピーできませんでした");
+    }
+  });
   const form = el.querySelector("#profile-form");
   form.querySelectorAll("input[name=color]").forEach((r) =>
     r.addEventListener("change", () => {

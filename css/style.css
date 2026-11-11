@@ -569,3 +569,12 @@ input:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: 
 .map-preview .chev { color: var(--text-3); flex: none; }
 .map-page.previewing .fab { opacity: 0; pointer-events: none; }
 .map-page .fab { transition: opacity .2s; }
+
+/* ショートカットの案内（設定画面） */
+.shortcut-box { margin-top: 20px; padding: 14px 16px; border-radius: 14px; background: var(--surface); border: 1px solid var(--line); }
+.shortcut-box h3 { margin: 0 0 6px; font-size: 15px; }
+.shortcut-box p, .shortcut-box ol { margin: 0 0 10px; font-size: 13px; line-height: 1.6; color: var(--text-2); }
+.shortcut-box ol { padding-left: 1.3em; }
+.shortcut-box .row { display: flex; gap: 8px; }
+.shortcut-box .row .btn { flex: 1; text-align: center; text-decoration: none; }
+.shortcut-box .fine { margin: 10px 0 0; font-size: 12px; }

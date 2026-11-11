@@ -40,6 +40,8 @@ const SHEETS = {
     'created_at', 'updated_at', 'processed_at',
     // 追加時に貼られた共有テキスト（店名・電話番号など）。店舗を正しく特定する手がかりに使う
     'hint',
+    // iPhone のショートカットが読み込んだページの解析結果（JSON）。食べログなどサーバーから読めないページ用
+    'prefetched',
   ],
 };
 
@@ -74,6 +76,15 @@ function doGet() {
 }
 
 function doPost(e) {
+  // iPhone のショートカットから: URL のクエリにパラメータ、本文に iPhone で読み込んだページの HTML
+  if (e.parameter && e.parameter.action === 'add_page') {
+    try {
+      return json_(addPage_(e.parameter, (e.postData && e.postData.contents) || ''));
+    } catch (err) {
+      console.error(err);
+      return json_({ ok: false, message: '追加できませんでした: ' + String((err && err.message) || err).slice(0, 200) });
+    }
+  }
   let req;
   try {
     req = JSON.parse(e.postData.contents);
@@ -228,6 +239,61 @@ function addCafe_(roomId, memberId, url, memo, name, hint) {
   };
   withLock_(() => append_('cafes', cafe));
   return cafeOut_(cafe);
+}
+
+/**
+ * ショートカットからの追加。token は「メンバーID.合言葉ハッシュ」（アプリの設定画面に表示）
+ * ページの解析はここで済ませ、情報収集の残り（AI・写真）は処理キューに任せる
+ */
+function addPage_(params, html) {
+  const token = String(params.token || '').trim();
+  const dot = token.indexOf('.');
+  const room = dot > 0 ? findRoom_(token.slice(dot + 1)) : null;
+  if (!room) throw new Error('ショートカットのコードが正しくありません。アプリの設定画面からコードを貼り直してください');
+  const memberId = token.slice(0, dot);
+
+  const shared = String(params.hint || '');
+  const url = String(params.url || '').trim() || (/https?:\/\/\S+/.exec(shared) || [])[0] || '';
+  if (!/^https?:\/\//i.test(url)) throw new Error('共有された内容にURLが見つかりませんでした');
+
+  let prefetched = '';
+  // TikTok はサーバー側の専用処理のほうが多く取れるので、それ以外のページだけ使う
+  if (html && html.length > 500 && classifyLink_(url).type !== 'tiktok') {
+    try {
+      const page = scrapePage_(url, { html: html, finalUrl: url });
+      if (page) prefetched = JSON.stringify(page).slice(0, 45000);
+    } catch (err) {
+      console.warn('prefetched parse failed', err);
+    }
+  }
+  const cafe = addCafe_(room.id, memberId, url, '', '', shared === url ? '' : shared);
+  if (prefetched) {
+    withLock_(() => {
+      const current = findCafe_(room.id, cafe.id);
+      current.prefetched = prefetched;
+      write_('cafes', current._row, current);
+    });
+  }
+  kickQueueSoon_();
+  const name = prefetched ? JSON.parse(prefetched).info.name : '';
+  return { ok: true, message: name ? `「${name}」を追加しました。情報を集めています` : '追加しました。情報を集めています' };
+}
+
+// ショートカットの応答を待たせないよう、処理キューは数秒後に別の実行で動かす
+function kickQueueSoon_() {
+  try {
+    const exists = ScriptApp.getProjectTriggers().some((t) => t.getHandlerFunction() === 'runQueueOnce');
+    if (!exists) ScriptApp.newTrigger('runQueueOnce').timeBased().after(5 * 1000).create();
+  } catch (err) {
+    console.warn('trigger failed', err); // 5分おきの定期処理が拾う
+  }
+}
+
+function runQueueOnce() {
+  ScriptApp.getProjectTriggers()
+    .filter((t) => t.getHandlerFunction() === 'runQueueOnce')
+    .forEach((t) => ScriptApp.deleteTrigger(t));
+  runQueue_();
 }
 
 function updateCafe_(roomId, id, patch) {
@@ -455,7 +521,9 @@ function processCafe_(cafe, deadline) {
   try {
     const sourceUrl = cafe.source_url;
     const sourceType = classifyLink_(sourceUrl).type;
-    const source = scrapePage_(sourceUrl);
+    // iPhone のショートカットが読み込んだページがあればそれを使う（食べログなどサーバーから読めないページ）
+    const prefetched = parsePrefetched_(cafe.prefetched);
+    const source = prefetched || scrapePage_(sourceUrl);
     const sourceError = lastFetchError_;
     const pages = source ? [source] : [];
 
@@ -579,6 +647,16 @@ function processCafe_(cafe, deadline) {
   }
 }
 
+function parsePrefetched_(v) {
+  if (!v) return null;
+  try {
+    const p = JSON.parse(v);
+    return p && p.info ? p : null;
+  } catch (err) {
+    return null;
+  }
+}
+
 function RetryableError_(message) {
   this.message = message;
 }
@@ -661,19 +739,19 @@ function decodeResponse_(res, contentType) {
   }
 }
 
-function scrapePage_(url) {
+function scrapePage_(url, prefetched) {
   // TikTok は通常のページ解析では情報が取れないので専用処理
-  if (/(^|\.)tiktok\.com$/.test((parseUrl_(url) || {}).host || '')) {
+  if (!prefetched && /(^|\.)tiktok\.com$/.test((parseUrl_(url) || {}).host || '')) {
     const tiktok = scrapeTikTok_(url);
     if (tiktok) return tiktok;
   }
   // 食べログはクラウドのサーバーからのアクセスを拒否している（HTTP 403）ので取りに行かない。
   // 店舗情報は Gemini の Google 検索で調べる。
-  if (classifyLink_(url).type === 'tabelog') {
-    lastFetchError_ = '食べログはサーバーからの取得を受け付けていません';
+  if (!prefetched && classifyLink_(url).type === 'tabelog') {
+    lastFetchError_ = '食べログはサーバーからの取得を受け付けていません。iPhoneのショートカットから追加すると読み込めます';
     return null;
   }
-  const res = fetchHtml_(url);
+  const res = prefetched || fetchHtml_(url);
   if (!res) return null;
   const html = res.html;
   const finalUrl = res.finalUrl;
@@ -773,7 +851,7 @@ function scrapePage_(url) {
     // 食べログには周辺店舗の写真も載っているため、alt が「店名 - ○○写真」のものだけを使う
     const storeName = info.name || cleanTitle_(ogTitle);
     let found = collectTabelogPhotos_(html, storeName);
-    if (found.length < 4) {
+    if (found.length < 4 && !prefetched) {
       const base = finalUrl.replace(/(\/\d{6,}\/).*$/, '$1');
       const photoPage = fetchHtml_(base + 'dtlphotolst/');
       if (photoPage) found = found.concat(collectTabelogPhotos_(photoPage.html, storeName));
