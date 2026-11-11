@@ -463,8 +463,11 @@ function isRetryWaiting_(c) {
 
 /** 時間主導トリガー（5分おき）: 処理キューを動かし、座標のないカフェを補完する */
 function processPending() {
+  const started = Date.now();
   runQueue_();
   geocodeMissing_(null, 20);
+  // 残り時間で、ドライブに保存できていなかった写真を保存し直す
+  migratePhotos_(20, started + 5 * 60 * 1000);
 }
 
 // ===========================================================================
@@ -1588,21 +1591,77 @@ function storePhotos_(cafeId, urls) {
     if (!/^image\/(jpeg|png|webp)$/.test(type)) return;
     const blob = res.getBlob();
     const size = blob.getBytes().length;
-    if (size < 8000 || size > 5000000) return; // アイコン等の小さすぎる画像は除外
-    if (!CONFIG.SAVE_PHOTOS_TO_DRIVE) {
-      out.push(urls[i]);
-      return;
-    }
-    try {
-      const ext = type === 'image/png' ? 'png' : type === 'image/webp' ? 'webp' : 'jpg';
-      blob.setName(`${cafeId}-${Date.now()}-${i}.${ext}`);
-      out.push(savePhotoBlob_(blob));
-    } catch (err) {
-      console.warn('drive save failed', err);
-      out.push(urls[i]);
-    }
+    if (size < 4000 || size > 5000000) return; // アイコン等の小さすぎる画像は除外
+    out.push(saveOrKeep_(blob, type, `${cafeId}-${Date.now()}-${i}`, urls[i]));
   });
   return out;
+}
+
+// ドライブに保存して表示用URLを返す。保存できないときは元のURLのまま（後で migratePhotos_ が保存し直す）
+function saveOrKeep_(blob, type, baseName, originalUrl) {
+  if (!CONFIG.SAVE_PHOTOS_TO_DRIVE || driveBlocked_()) return originalUrl;
+  try {
+    const ext = type === 'image/png' ? 'png' : type === 'image/webp' ? 'webp' : 'jpg';
+    blob.setName(`${baseName}.${ext}`);
+    return savePhotoBlob_(blob);
+  } catch (err) {
+    console.warn('drive save failed', err);
+    // 容量・利用上限などで失敗したら、しばらくドライブへの保存を試さない
+    PropertiesService.getScriptProperties().setProperty('DRIVE_BLOCKED_UNTIL', String(Date.now() + 60 * 60 * 1000));
+    PropertiesService.getScriptProperties().setProperty('DRIVE_LAST_ERROR', String((err && err.message) || err).slice(0, 200));
+    return originalUrl;
+  }
+}
+
+function driveBlocked_() {
+  return Number(PropertiesService.getScriptProperties().getProperty('DRIVE_BLOCKED_UNTIL') || 0) > Date.now();
+}
+
+function isDrivePhoto_(url) {
+  return /^https:\/\/lh3\.googleusercontent\.com\/d\//.test(String(url));
+}
+
+/**
+ * ドライブに保存できていない写真（元サイトのURLのもの）を保存し直す。
+ * Instagram・TikTok の画像URLは期限切れで見られなくなるため。見られなくなったものは外す
+ */
+function migratePhotos_(maxPhotos, deadline) {
+  if (!CONFIG.SAVE_PHOTOS_TO_DRIVE || driveBlocked_()) return 0;
+  let done = 0;
+  const cafes = readAll_('cafes').filter((c) => c.status === 'done' && parseJsonArray_(c.photos).some((u) => !isDrivePhoto_(u)));
+  for (const c of cafes) {
+    if (done >= maxPhotos || Date.now() > deadline || driveBlocked_()) break;
+    const photos = parseJsonArray_(c.photos);
+    const next = [];
+    photos.forEach((u, i) => {
+      if (isDrivePhoto_(u) || done >= maxPhotos || Date.now() > deadline || driveBlocked_()) return next.push(u);
+      let res = null;
+      try {
+        res = UrlFetchApp.fetch(u, { muteHttpExceptions: true, headers: { 'User-Agent': UA, Referer: (/^(https?:\/\/[^/]+)/.exec(u) || [])[1] + '/' } });
+      } catch (err) {
+        return next.push(u); // 通信エラーは次の機会に
+      }
+      const code = res.getResponseCode();
+      const type = String(header_(res, 'Content-Type') || '').split(';')[0].trim();
+      if (code !== 200 || !/^image\/(jpeg|png|webp)$/.test(type)) {
+        if (code === 403 || code === 404 || code === 410 || code === 200) return; // 期限切れ・削除済み
+        return next.push(u);
+      }
+      done++;
+      next.push(saveOrKeep_(res.getBlob(), type, `${c.id}-m${Date.now()}-${i}`, u));
+    });
+    if (JSON.stringify(next) !== JSON.stringify(photos)) {
+      withLock_(() => {
+        const current = findCafe_(c.room_id, c.id);
+        if (!current) return;
+        // 処理中に利用者が写真を編集していたら触らない
+        if (String(current.photos) !== String(c.photos)) return;
+        current.photos = next;
+        write_('cafes', current._row, current);
+      });
+    }
+  }
+  return done;
 }
 
 function savePhotoBlob_(blob) {
