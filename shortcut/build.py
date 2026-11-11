@@ -71,7 +71,8 @@ actions = [
     # 0: コード（取り込み時に入力してもらう）
     action("is.workflow.actions.gettext", UUID=U_CODE, WFTextActionText=""),
     # 1-2: 共有された内容から最初の URL
-    action("is.workflow.actions.detect.link", UUID=U_LINKS, WFInput=attachment(SHORTCUT_INPUT)),
+    # 入力はテキストとして渡す（変数そのものを渡すと、共有されたURLが取り出せず空になる）
+    action("is.workflow.actions.detect.link", UUID=U_LINKS, WFInput=token_string(SHORTCUT_INPUT)),
     action("is.workflow.actions.getitemfromlist", UUID=U_FIRST, WFItemSpecifier="First Item",
            WFInput=attachment(output(U_LINKS, "URL"))),
     # 3: iPhone でページを読み込む
@@ -79,8 +80,10 @@ actions = [
            WFURL=token_string(output(U_FIRST, "リストからの項目"))),
     # 4-5: URL とコードをクエリ用にエンコード
     # （共有された内容そのものは付けない。Safari から共有するとページ本文全体になり、URL が長すぎて無効になるため）
-    action("is.workflow.actions.urlencode", UUID=U_ENC_URL, WFInput=token_string(output(U_FIRST, "リストからの項目"))),
-    action("is.workflow.actions.urlencode", UUID=U_ENC_CODE, WFInput=token_string(output(U_CODE, "テキスト"))),
+    action("is.workflow.actions.urlencode", UUID=U_ENC_URL, WFEncodeMode="Encode",
+           WFInput=token_string(output(U_FIRST, "リストからの項目"))),
+    action("is.workflow.actions.urlencode", UUID=U_ENC_CODE, WFEncodeMode="Encode",
+           WFInput=token_string(output(U_CODE, "テキスト"))),
     # 6: ページの HTML を GAS に送る
     action("is.workflow.actions.downloadurl", UUID=U_POST, WFHTTPMethod="POST", WFHTTPBodyType="File",
            WFURL=token_string(f"{API_URL}?action=add_page&token=", output(U_ENC_CODE, "URLエンコードされたテキスト"),
