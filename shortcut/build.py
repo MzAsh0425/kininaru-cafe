@@ -65,7 +65,7 @@ def action(identifier, **params):
     return {"WFWorkflowActionIdentifier": identifier, "WFWorkflowActionParameters": params}
 
 
-U_CODE, U_LINKS, U_FIRST, U_PAGE, U_ENC_URL, U_ENC_IN, U_POST, U_MSG = (uid() for _ in range(8))
+U_CODE, U_LINKS, U_FIRST, U_PAGE, U_ENC_URL, U_ENC_CODE, U_POST, U_MSG = (uid() for _ in range(8))
 
 actions = [
     # 0: コード（取り込み時に入力してもらう）
@@ -77,14 +77,14 @@ actions = [
     # 3: iPhone でページを読み込む
     action("is.workflow.actions.downloadurl", UUID=U_PAGE, WFHTTPMethod="GET",
            WFURL=token_string(output(U_FIRST, "リストからの項目"))),
-    # 4-5: URL と共有テキスト（店名などの手がかり）をクエリ用にエンコード
+    # 4-5: URL とコードをクエリ用にエンコード
+    # （共有された内容そのものは付けない。Safari から共有するとページ本文全体になり、URL が長すぎて無効になるため）
     action("is.workflow.actions.urlencode", UUID=U_ENC_URL, WFInput=token_string(output(U_FIRST, "リストからの項目"))),
-    action("is.workflow.actions.urlencode", UUID=U_ENC_IN, WFInput=token_string(SHORTCUT_INPUT)),
+    action("is.workflow.actions.urlencode", UUID=U_ENC_CODE, WFInput=token_string(output(U_CODE, "テキスト"))),
     # 6: ページの HTML を GAS に送る
     action("is.workflow.actions.downloadurl", UUID=U_POST, WFHTTPMethod="POST", WFHTTPBodyType="File",
-           WFURL=token_string(f"{API_URL}?action=add_page&token=", output(U_CODE, "テキスト"),
-                              "&url=", output(U_ENC_URL, "URLエンコードされたテキスト"),
-                              "&hint=", output(U_ENC_IN, "URLエンコードされたテキスト")),
+           WFURL=token_string(f"{API_URL}?action=add_page&token=", output(U_ENC_CODE, "URLエンコードされたテキスト"),
+                              "&url=", output(U_ENC_URL, "URLエンコードされたテキスト")),
            WFRequestVariable=attachment(output(U_PAGE, "URLの内容"))),
     # 7-8: 結果を通知
     action("is.workflow.actions.getvalueforkey", UUID=U_MSG, WFDictionaryKey="message",
