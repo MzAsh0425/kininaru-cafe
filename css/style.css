@@ -114,6 +114,8 @@ input[type=text], input[type=url], input[type=password], input[type=tel], textar
 }
 textarea { resize: vertical; min-height: 88px; }
 textarea.url-field { min-height: 0; resize: none; word-break: break-all; }
+label.field .note { display: block; margin: 6px 4px 0; font-size: 12px; color: var(--accent); line-height: 1.5; }
+label.field .note[hidden] { display: none; }
 input:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; border-color: transparent; }
 
 /* ------------------------------------------------------------------ login */

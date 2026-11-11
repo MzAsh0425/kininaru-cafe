@@ -38,6 +38,8 @@ const SHEETS = {
     'hours', 'holidays', 'price', 'phone', 'access',
     'links', 'photos', 'memo', 'visited',
     'created_at', 'updated_at', 'processed_at',
+    // 追加時に貼られた共有テキスト（店名・電話番号など）。店舗を正しく特定する手がかりに使う
+    'hint',
   ],
 };
 
@@ -107,7 +109,7 @@ function handle_(req) {
     case 'update_member':
       return updateMember_(room.id, req.p_member_id, req.p_name, req.p_color);
     case 'add_cafe':
-      return addCafe_(room.id, req.p_member_id, req.p_url, req.p_memo);
+      return addCafe_(room.id, req.p_member_id, req.p_url, req.p_memo, req.p_name, req.p_hint);
     case 'update_cafe':
       return updateCafe_(room.id, req.p_id, req.p_patch || {});
     case 'delete_cafe':
@@ -202,7 +204,7 @@ function findCafe_(roomId, id) {
   return readAll_('cafes').find((c) => c.id === id && c.room_id === roomId) || null;
 }
 
-function addCafe_(roomId, memberId, url, memo) {
+function addCafe_(roomId, memberId, url, memo, name, hint) {
   if (!readAll_('members').some((m) => m.id === memberId && m.room_id === roomId)) {
     throw new Error('member not in room');
   }
@@ -218,6 +220,8 @@ function addCafe_(roomId, memberId, url, memo) {
     links: [],
     photos: [],
     memo: String(memo || '').trim(),
+    name: String(name || '').trim().slice(0, 100),
+    hint: String(hint || '').trim().slice(0, 1000),
     visited: false,
     created_at: t,
     updated_at: t,
@@ -455,13 +459,26 @@ function processCafe_(cafe, deadline) {
     const sourceError = lastFetchError_;
     const pages = source ? [source] : [];
 
+    // 利用者が入れた店名・共有テキスト（食べログアプリの共有なら店名と電話番号が入っている）
+    const hintInfo = parseHint_(cafe.name, cafe.hint);
+
     const apiKey = PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY');
     let ai = null;
     let aiError = '';
+    let aiWarning = '';
     if (apiKey) {
       try {
-        ai = researchWithGemini_(apiKey, sourceUrl, source, timeLeft);
+        ai = researchWithGemini_(apiKey, sourceUrl, source, timeLeft, hintInfo);
         if (!ai) aiError = 'AIの回答を読み取れませんでした';
+        // 別の店舗を返していないか、店名・電話番号・住所・食べログの店舗IDで確かめる
+        const check = ai ? checkSameShop_(ai, hintInfo, source, sourceUrl) : null;
+        if (check && !check.ok) {
+          console.warn('gemini returned another shop', check.reason, JSON.stringify(ai.info));
+          ai = null;
+          aiError = `AIが別の店舗の情報を返したため採用しませんでした（${check.reason}）`;
+        } else if (check && check.unverified) {
+          aiWarning = '食べログのページは読めないため、AIが検索で調べた結果です。違うお店だったら「編集」で直すか、店名を入れて追加し直してください';
+        }
       } catch (err) {
         console.error('gemini failed', err);
         aiError = String((err && err.message) || err).slice(0, 200);
@@ -471,12 +488,13 @@ function processCafe_(cafe, deadline) {
     }
 
     // ページが読めず、AI でも店舗を特定できなかった
-    if (!source && !(ai && ai.info.name) && sourceType !== 'tiktok') {
+    if (!source && !(ai && ai.info.name) && !hintInfo.name && sourceType !== 'tiktok') {
       const why = sourceType === 'tabelog'
         ? '食べログはサーバーからの自動取得を受け付けていないため、AI（Gemini）の検索で調べます'
         : `ページを取得できませんでした（${sourceError || '不明なエラー'}）`;
       const aiMsg = apiKey ? `AIでも店舗を特定できませんでした（${aiError || '不明'}）` : 'Gemini APIキーが未設定です';
-      throw new Error(`${why}。${aiMsg}。「手動で入力」から店名などを入れてください`);
+      const ask = sourceType === 'tabelog' ? '店名を入れて追加し直すか、' : '';
+      throw new Error(`${why}。${aiMsg}。${ask}「手動で入力」から店名などを入れてください`);
     }
 
     // AIが見つけた公式アカウント等を優先（共有元URL自体は source_url として別途表示する）
@@ -500,7 +518,8 @@ function processCafe_(cafe, deadline) {
     // 情報のマージ: Gemini > 食べログ > その他ページ の順に優先
     const ordered = pages.slice().sort((a, b) => pageRank_(a.url) - pageRank_(b.url));
     const info = {};
-    [ai ? ai.info : {}].concat(ordered.map((p) => p.info)).forEach((src) => {
+    // 利用者が入れた店名・共有テキストの電話番号を最優先にする
+    [hintInfo, ai ? ai.info : {}].concat(ordered.map((p) => p.info)).forEach((src) => {
       Object.keys(src).forEach((k) => {
         const v = src[k];
         if (v === undefined || v === null || v === '') return;
@@ -534,7 +553,7 @@ function processCafe_(cafe, deadline) {
       current.links = dedupeLinks_(parseJsonArray_(current.links).concat(links));
       current.photos = dedupe_(parseJsonArray_(current.photos).concat(photos)).slice(0, 12);
       current.status = 'done';
-      current.error = ai || !apiKey ? '' : `AIによる補完に失敗したため、ページ解析結果のみです（${aiError}）`;
+      current.error = ai ? aiWarning : !apiKey ? '' : `AIによる補完に失敗したため、${source ? 'ページ解析結果' : '入力された情報'}のみです（${aiError}）`;
       current.processed_at = now_();
       current.updated_at = now_();
       write_('cafes', current._row, current);
@@ -1152,19 +1171,25 @@ const CAFE_SCHEMA = {
   ],
 };
 
-function researchWithGemini_(apiKey, sourceUrl, source, timeLeft) {
+function researchWithGemini_(apiKey, sourceUrl, source, timeLeft, hintInfo) {
   const model = PropertiesService.getScriptProperties().getProperty('GEMINI_MODEL') || CONFIG.GEMINI_MODEL_DEFAULT;
   const tabelog = /tabelog\.com\/(?:[a-z]{2}\/)?[a-z]+\/A\d+\/A\d+\/(\d+)/.exec(sourceUrl);
-  const hints = source
+  hintInfo = hintInfo || {};
+  const userHint = hintInfo.name || hintInfo.phone
+    ? `\n\n【重要・確実な情報】共有した人によると、店名は「${hintInfo.name || '不明'}」${hintInfo.phone ? `、電話番号は ${hintInfo.phone}` : ''} です。` +
+      'この店名（と電話番号）で検索して、必ずこの店舗の情報を返してください。'
+    : '';
+  const hints = userHint + (source
     ? `\n\n参考: 共有URLを事前に解析した結果（不正確な場合あり）\n${JSON.stringify({ info: source.info, links: source.links }, null, 1).slice(0, 3000)}`
     : tabelog
-      ? `\n\n（共有URLは食べログの店舗ページです。ページは直接読み込めないことがあるので、Google検索で「${canonicalUrl_(sourceUrl)}」や「食べログ ${tabelog[1]}」を調べて店舗を特定してください）`
-      : '\n\n（共有URLは直接取得できませんでした。SNSなどの可能性があります）';
+      ? `\n\n（共有URLは食べログの店舗ページです。ページは直接読み込めないので、Google検索で「${canonicalUrl_(sourceUrl)}」を調べ、検索結果に出てくるこのURL（店舗ID ${tabelog[1]}）の店名を確認してください。tabelog_url には確認できた場合だけこのURLを入れること）`
+      : '\n\n（共有URLは直接取得できませんでした。SNSなどの可能性があります）');
   const prompt =
     `次のURLは友人が「気になるカフェ」として共有したものです。\n${sourceUrl}\n\n` +
     'このURLが指す店舗を特定し、Google検索とURLの読み込みで、公式サイト・食べログ・Instagram・X・Googleマップなどの関連リンクと、' +
     '住所・営業時間・定休日・予算・アクセスなどの基本情報を調べてください。' +
     '情報は日本語でまとめ、確認できなかった項目は空文字にしてください（推測で埋めないこと）。' +
+    '店舗をはっきり特定できなかった場合は、似た名前や近くの別の店を挙げずに、すべての項目を空文字にしてください。' +
     'URLは検索結果や読み込んだページで実在を確認できたものだけを、正規のURL（リダイレクト用URLではなく）で入れてください。' +
     `結果は指定のJSON形式で返してください。${hints}`;
 
@@ -1260,6 +1285,129 @@ function researchWithGemini_(apiKey, sourceUrl, source, timeLeft) {
     throw new Error('AIの回答を読み取れませんでした');
   }
   return toAiResult_(parsed, timeLeft);
+}
+
+// ===========================================================================
+// 店舗の照合（AIが別の店を返していないか確かめる）
+// ===========================================================================
+// 追加時に入力された店名と、貼られた共有テキストから店名・電話番号を取り出す
+function parseHint_(name, hint) {
+  const out = {};
+  const text = String(hint || '')
+    .replace(/https?:\/\/\S+/g, '\n')
+    .replace(/[#＃]\S+/g, ' ');
+  const phone = /(?:\+81[-\s]?|0)\d{1,4}[-\s(（]?\d{1,4}[-\s)）]?\d{3,4}/.exec(text);
+  if (phone) out.phone = phone[0].trim();
+  let n = String(name || '').trim();
+  if (!n) {
+    const line = text.split(/\n/)
+      .map((x) => x.replace(/(?:TEL|電話)\s*[:：]?\s*[\d\-+() ]+/gi, '').trim())
+      .find((x) => x.length >= 2 && !/^[\d\-+() ]+$/.test(x));
+    n = line || '';
+  }
+  // 「店名 (最寄り駅/ジャンル)」「店名 - 食べログ」のような飾りを外す
+  n = n.replace(/\s*[\[［【]?\s*食べログ\s*[\]］】]?\s*$/, '')
+    .replace(/\s*[-|｜]\s*(?:食べログ|Retty|ホットペッパー.*|Google.*)$/i, '')
+    .replace(/\s+[-|｜]\s+[^-|｜]*\/[^-|｜]*$/, '')
+    .replace(/\s*[（(][^（()）]*\/[^（()）]*[）)]\s*$/, '')
+    .trim();
+  if (n.length >= 2 && n.length <= 60) out.name = n;
+  return out;
+}
+
+/**
+ * AIの結果が、手がかり（入力された店名・共有テキスト・ページの情報・食べログの店舗ID）と同じ店かを確かめる
+ * @return {{ok: boolean, reason?: string, unverified?: boolean}}
+ */
+function checkSameShop_(ai, hintInfo, source, sourceUrl) {
+  const info = ai.info || {};
+  const social = ['instagram', 'tiktok', 'x', 'facebook', 'threads'].indexOf(classifyLink_(sourceUrl).type) >= 0;
+  const page = source && !social ? source.info || {} : {};
+  const anchor = {
+    name: hintInfo.name || page.name || '',
+    phone: hintInfo.phone || page.phone || '',
+    address: page.address || '',
+  };
+
+  // AI が見つけた食べログのページが、共有された食べログのページと違う店なら別の店
+  const id = (u) => ((/tabelog\.com\/(?:[a-z]{2}\/)?[a-z]+\/A\d+\/A\d+\/(\d+)/.exec(String(u || '')) || [])[1] || '');
+  const sourceId = id(sourceUrl);
+  const aiIds = (ai.links || []).map((l) => id(l.url)).filter(Boolean);
+  if (sourceId && aiIds.length && aiIds.indexOf(sourceId) < 0) return { ok: false, reason: `食べログの店舗IDが違います: ${aiIds[0]}` };
+
+  // 電話番号が両方あれば、それで判断する
+  if (anchor.phone && info.phone) {
+    return digits_(anchor.phone) === digits_(info.phone) ? { ok: true } : { ok: false, reason: `電話番号が違います: ${info.phone}` };
+  }
+  const nameOk = anchor.name && info.name ? similarName_(anchor.name, info.name) : null;
+  const addrOk = anchor.address && info.address ? similarAddress_(anchor.address, info.address) : null;
+  if (nameOk === false && addrOk !== true) return { ok: false, reason: `店名が違います: ${info.name}` };
+  if (addrOk === false && nameOk !== true) return { ok: false, reason: `住所が違います: ${info.address}` };
+  // 手がかりがあれば、AI はそれをもとに調べているので採用する（表記ゆれで比べられない場合も含む）
+  if (anchor.name || anchor.phone || anchor.address) return { ok: true };
+
+  // 手がかりがない食べログのリンク: AI が見つけた食べログURLの店舗IDで確かめるしかない
+  if (sourceId) {
+    if (!aiIds.length) return { ok: false, reason: '食べログの店舗ページを確認できませんでした' };
+    return { ok: true, unverified: true };
+  }
+  return { ok: true };
+}
+
+function digits_(s) {
+  return String(s || '').normalize('NFKC').replace(/\D/g, '').replace(/^81/, '0');
+}
+
+function normName_(s) {
+  return String(s || '').normalize('NFKC').toLowerCase()
+    .replace(/[\s\-_.,・'’"&/|｜!！?？()（）\[\]［］【】「」『』~〜]/g, '')
+    .replace(/(本店|店|cafe|café|カフェ|coffee|コーヒー|珈琲|喫茶)$/g, '');
+}
+
+function similarName_(a, b) {
+  const x = normName_(a);
+  const y = normName_(b);
+  if (!x || !y) return null;
+  if (x.indexOf(y) >= 0 || y.indexOf(x) >= 0) return true;
+  // 表記ゆれ（カタカナ/英字など）は判断できないので、文字がほとんど重ならないときだけ「違う」とする
+  const latin = (s) => /^[a-z0-9]+$/.test(s);
+  if (latin(x) !== latin(y)) return null;
+  return dice_(x, y) >= 0.5;
+}
+
+function similarAddress_(a, b) {
+  const key = (s) => {
+    const t = String(s || '').normalize('NFKC').replace(/〒?\s*\d{3}-?\d{4}/, '').replace(/\s/g, '')
+      .replace(/丁目|番地|番|号/g, '-').replace(/[－ー−‐]/g, '-');
+    const m = /^(.*?\d+(?:-\d+)*)/.exec(t);
+    return m ? m[1].replace(/-$/, '') : t;
+  };
+  const x = key(a);
+  const y = key(b);
+  if (!x || !y) return null;
+  const [shorter, longer] = x.length <= y.length ? [x, y] : [y, x];
+  return longer.indexOf(shorter.slice(-6)) >= 0;
+}
+
+function dice_(a, b) {
+  const grams = (s) => {
+    const out = [];
+    for (let i = 0; i < s.length - 1; i++) out.push(s.slice(i, i + 2));
+    return out;
+  };
+  const ga = grams(a);
+  const gb = grams(b);
+  if (!ga.length || !gb.length) return a === b ? 1 : 0;
+  let hit = 0;
+  const pool = gb.slice();
+  ga.forEach((g) => {
+    const i = pool.indexOf(g);
+    if (i >= 0) {
+      hit++;
+      pool.splice(i, 1);
+    }
+  });
+  return (2 * hit) / (ga.length + gb.length);
 }
 
 function geminiRetryDelayMs_(res) {
@@ -1420,9 +1568,17 @@ function sheet_(name) {
     sh = ss.insertSheet(name);
     sh.getRange(1, 1, 1, cols.length).setValues([cols]).setFontWeight('bold');
     sh.setFrozenRows(1);
+  } else if (!sheetChecked_[name]) {
+    // 後から列を追加したときは見出しを足す
+    const cols = SHEETS[name];
+    if (sh.getLastColumn() < cols.length) {
+      sh.getRange(1, 1, 1, cols.length).setValues([cols]).setFontWeight('bold');
+    }
   }
+  sheetChecked_[name] = true;
   return sh;
 }
+const sheetChecked_ = {};
 
 function readAll_(name) {
   const sh = sheet_(name);
